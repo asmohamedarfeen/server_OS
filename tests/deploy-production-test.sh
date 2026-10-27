@@ -433,6 +433,10 @@ test_sha_mismatch_stops_before_sync() {
 test_workflow_contract() {
   local workflow="$PROJECT_ROOT/.github/workflows/deploy-production.yml"
   [[ -f "$workflow" ]] || fail "missing production workflow: $workflow"
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo 'SKIP: test_workflow_contract (Ruby YAML parser unavailable on this host)'
+    return
+  fi
 
   ruby -ryaml -e '
     workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
