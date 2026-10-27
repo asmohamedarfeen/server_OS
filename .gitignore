@@ -1,0 +1,11 @@
+.env
+.DS_Store
+node_modules/
+frontend/.next/
+frontend/node_modules/
+backend/.venv/
+backend/__pycache__/
+*.py[cod]
+*.db
+storage/*
+!storage/.gitkeep

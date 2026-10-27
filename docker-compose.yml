@@ -1,0 +1,95 @@
+name: arfeen-cloud
+
+services:
+  traefik:
+    image: traefik:v3.7.16
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=arfeen_proxy
+      - --entrypoints.web.address=:80
+      - --api.dashboard=false
+      - --log.level=INFO
+    ports:
+      - "${CLOUD_BIND:-0.0.0.0}:${CLOUD_PORT:-8080}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - proxy
+    labels:
+      - com.arfeen.system=true
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    init: true
+    pid: host
+    environment:
+      DATA_DIR: /data
+      WORKSPACE_DIR: /workspace
+      STORAGE_DIR: /data/files
+      JWT_SECRET: ${JWT_SECRET:?Run ./scripts/install.sh to generate secrets}
+      SETUP_TOKEN: ${SETUP_TOKEN:?Run ./scripts/install.sh to generate secrets}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - arfeen_data:/data
+      - ./storage:/data/files
+      - deploy_workspace:/workspace
+      - /:/host:rw
+      - /dev:/host/dev:rw
+      - /proc:/host/proc:rw
+      - /sys:/host/sys:ro
+      - /run:/host/run:rw
+    cap_add:
+      - SYS_CHROOT
+    networks:
+      - internal
+      - proxy
+    labels:
+      - traefik.enable=true
+      - com.arfeen.system=true
+      - traefik.docker.network=arfeen_proxy
+      - traefik.http.routers.arfeen-terminal.rule=Path(`/api/terminal`)
+      - traefik.http.routers.arfeen-terminal.entrypoints=web
+      - traefik.http.routers.arfeen-terminal.priority=100
+      - traefik.http.services.arfeen-terminal.loadbalancer.server.port=8000
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    depends_on:
+      - backend
+    networks:
+      - proxy
+      - internal
+    labels:
+      - traefik.enable=true
+      - com.arfeen.system=true
+      - traefik.docker.network=arfeen_proxy
+      - traefik.http.routers.arfeen-cloud.rule=PathPrefix(`/`)
+      - traefik.http.routers.arfeen-cloud.entrypoints=web
+      - traefik.http.routers.arfeen-cloud.priority=1
+      - traefik.http.services.arfeen-cloud.loadbalancer.server.port=3000
+
+networks:
+  proxy:
+    name: arfeen_proxy
+    labels:
+      com.arfeen.system: "true"
+  internal:
+    name: arfeen_internal
+    internal: true
+    labels:
+      com.arfeen.system: "true"
+
+volumes:
+  arfeen_data:
+    labels:
+      com.arfeen.system: "true"
+  deploy_workspace:
+    labels:
+      com.arfeen.system: "true"
