@@ -248,3 +248,13 @@ git push origin main
 ```
 
 Expected: the documentation-only commit triggers and passes one final deployment, leaving local and remote `main` aligned.
+
+## Validation record
+
+- Runner: `actions.runner.asmohamedarfeen-server_OS.mastercontrol-production.service`, GitHub Actions Runner `2.338.0`, active/enabled and connected with the `arfeen-production` label.
+- Initial production commit: `78a7f704dfb31ab5d213c09210c93556d96eda6d` on `main`.
+- Push-triggered workflow: **Deploy production #1**, successful in 5m 24s.
+- Manual workflow dispatch: **Deploy production #2**, successful in 1m 0s.
+- Health: three `arfeen-cloud-*` containers running and `http://127.0.0.1:8080/` returned HTTP 200 after both deployments.
+- Persistence: `.env` remained `root:root` mode `0600` with an identical SHA-256 fingerprint; `storage/` file count, `arfeen_data`, and `deploy_workspace` remained unchanged.
+- Privilege boundary: general passwordless sudo remains disabled; `/etc/sudoers.d/arfeen-actions-runner` allows only the four exact Compose commands used by the deployment script.

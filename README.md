@@ -224,14 +224,14 @@ Check runner and application status on Ubuntu with:
 
 ```bash
 systemctl status 'actions.runner.*'
-sudo journalctl -u '<exact-service-name>' --since '30 minutes ago'
+sudo journalctl -u actions.runner.asmohamedarfeen-server_OS.mastercontrol-production.service --since '30 minutes ago'
 cd /home/md/arfeen-cloud
 sudo docker compose ps
 sudo docker compose logs --tail=100 traefik backend frontend
 curl --fail --silent --show-error http://127.0.0.1:8080/ >/dev/null
 ```
 
-Replace `<exact-service-name>` with the unit name shown by the `systemctl status` command. When a deployment fails, inspect its GitHub Actions log first, then check the runner service, Compose status, and recent service logs. Confirm the current dashboard still responds before rerunning the workflow. Do not replace the server's `.env` or `storage/` directory while recovering; automatic source rollback deliberately leaves both untouched.
+When a deployment fails, inspect its GitHub Actions log first, then check the runner service, Compose status, and recent service logs. Confirm the current dashboard still responds before rerunning the workflow. Do not replace the server's `.env` or `storage/` directory while recovering; automatic source rollback deliberately leaves both untouched.
 
 ### Manual archive update
 
