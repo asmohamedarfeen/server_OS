@@ -236,6 +236,37 @@ test_sha_mismatch_stops_before_sync() {
   pass test_sha_mismatch_stops_before_sync
 }
 
+test_workflow_contract() {
+  local workflow="$PROJECT_ROOT/.github/workflows/deploy-production.yml"
+  [[ -f "$workflow" ]] || fail "missing production workflow: $workflow"
+
+  ruby -ryaml -e '
+    workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
+    triggers = workflow.fetch("on")
+    raise "unexpected triggers" unless triggers.keys.sort == ["push", "workflow_dispatch"]
+    raise "push must target main only" unless triggers.fetch("push").fetch("branches") == ["main"]
+    raise "workflow permissions must be read-only" unless workflow.fetch("permissions") == {"contents" => "read"}
+    concurrency = workflow.fetch("concurrency")
+    raise "wrong concurrency group" unless concurrency.fetch("group") == "arfeen-production"
+    raise "deployments may not cancel in progress" unless concurrency.fetch("cancel-in-progress") == false
+    jobs = workflow.fetch("jobs")
+    raise "expected one deploy-production job" unless jobs.keys == ["deploy-production"]
+    job = jobs.fetch("deploy-production")
+    raise "manual dispatch must be limited to main" unless job.fetch("if") == "github.ref == '\''refs/heads/main'\''"
+    raise "wrong runner labels" unless job.fetch("runs-on") == ["self-hosted", "linux", "x64", "arfeen-production"]
+    raise "wrong timeout" unless job.fetch("timeout-minutes") == 45
+    steps = job.fetch("steps")
+    checkout = steps.fetch(0)
+    raise "checkout must be pinned" unless checkout.fetch("uses") == "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    raise "checkout credentials must not persist" unless checkout.fetch("with").fetch("persist-credentials") == false
+    raise "checkout must use triggering SHA" unless checkout.fetch("with").fetch("ref") == "${{ github.sha }}"
+    deploy = steps.fetch(1)
+    raise "unexpected deploy command" unless deploy.fetch("run") == "bash scripts/deploy-production.sh"
+  ' "$workflow" || fail 'production workflow violates its deployment contract'
+
+  pass test_workflow_contract
+}
+
 [[ -f "$DEPLOY_SCRIPT" ]] || fail "missing deployment script: $DEPLOY_SCRIPT"
 
 test_success_preserves_protected_paths
@@ -243,5 +274,6 @@ test_failed_compose_restores_previous_source
 test_health_timeout_restores_previous_source
 test_lock_prevents_concurrent_deploy
 test_sha_mismatch_stops_before_sync
+test_workflow_contract
 
 echo "All $TEST_COUNT deployment tests passed."
