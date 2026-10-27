@@ -6,6 +6,7 @@ DEPLOY_DIR="${ARFEEN_DEPLOY_DIR:-/home/md/arfeen-cloud}"
 LOCK_FILE="${ARFEEN_LOCK_FILE:-/home/md/.arfeen-deploy.lock}"
 BACKUP_ROOT="${ARFEEN_BACKUP_ROOT:-/home/md/.arfeen-deploy-backups}"
 HEALTH_URL="${ARFEEN_HEALTH_URL:-http://127.0.0.1:8080/}"
+API_HEALTH_URL="${ARFEEN_API_HEALTH_URL:-http://127.0.0.1:8080/api/health}"
 HEALTH_ATTEMPTS="${ARFEEN_HEALTH_ATTEMPTS:-30}"
 HEALTH_INTERVAL="${ARFEEN_HEALTH_INTERVAL:-2}"
 
@@ -14,11 +15,11 @@ ROLLBACK_ARMED=false
 
 RSYNC_EXCLUDES=(
   --exclude='/.env'
-  --exclude='/storage/'
-  --exclude='/.git/'
-  --exclude='/frontend/node_modules/'
-  --exclude='/frontend/.next/'
-  --exclude='/backend/.venv/'
+  --exclude='/storage'
+  --exclude='/.git'
+  --exclude='/frontend/node_modules'
+  --exclude='/frontend/.next'
+  --exclude='/backend/.venv'
   --exclude='__pycache__/'
   --exclude='*.py[cod]'
   --exclude='/.DS_Store'
@@ -42,6 +43,20 @@ validate_absolute_path() {
   local value="$2"
   [[ "$value" == /* ]] || die "$name must be an absolute path"
   [[ "$value" != '/' ]] || die "$name may not be the filesystem root"
+}
+
+canonicalize_path() {
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+path_is_within() {
+  local child="$1"
+  local parent="$2"
+  [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+paths_overlap() {
+  path_is_within "$1" "$2" || path_is_within "$2" "$1"
 }
 
 cleanup() {
@@ -73,6 +88,19 @@ restore_previous_release() {
   fi
 }
 
+verify_compose_services() {
+  local expected_services
+  local running_services
+
+  if ! expected_services="$(sudo docker compose config --services | LC_ALL=C sort)"; then
+    die 'could not read the expected Compose services'
+  fi
+  if ! running_services="$(sudo docker compose ps --services --status running | LC_ALL=C sort)"; then
+    die 'could not read the running Compose services'
+  fi
+  [[ -n "$expected_services" && "$running_services" == "$expected_services" ]] || die 'not all Compose services are running'
+}
+
 handle_failure() {
   local original_status="${1:-1}"
   [[ "$original_status" -ne 0 ]] || original_status=1
@@ -92,7 +120,7 @@ trap 'handle_failure $?' ERR
 trap 'handle_failure 130' INT
 trap 'handle_failure 143' TERM
 
-for required_command in git rsync flock sudo docker curl mktemp; do
+for required_command in git rsync flock sudo docker curl mktemp python3; do
   command -v "$required_command" >/dev/null 2>&1 || die "required command is missing: $required_command"
 done
 
@@ -101,7 +129,23 @@ validate_absolute_path GITHUB_WORKSPACE "$SOURCE_DIR"
 validate_absolute_path ARFEEN_DEPLOY_DIR "$DEPLOY_DIR"
 validate_absolute_path ARFEEN_LOCK_FILE "$LOCK_FILE"
 validate_absolute_path ARFEEN_BACKUP_ROOT "$BACKUP_ROOT"
-[[ "$SOURCE_DIR" != "$DEPLOY_DIR" ]] || die 'source and deployment directories must differ'
+
+SOURCE_DIR="$(canonicalize_path "$SOURCE_DIR")"
+DEPLOY_DIR="$(canonicalize_path "$DEPLOY_DIR")"
+LOCK_FILE="$(canonicalize_path "$LOCK_FILE")"
+BACKUP_ROOT="$(canonicalize_path "$BACKUP_ROOT")"
+
+validate_absolute_path GITHUB_WORKSPACE "$SOURCE_DIR"
+validate_absolute_path ARFEEN_DEPLOY_DIR "$DEPLOY_DIR"
+validate_absolute_path ARFEEN_LOCK_FILE "$LOCK_FILE"
+validate_absolute_path ARFEEN_BACKUP_ROOT "$BACKUP_ROOT"
+paths_overlap "$SOURCE_DIR" "$DEPLOY_DIR" && die 'source and deployment directories may not overlap'
+if paths_overlap "$BACKUP_ROOT" "$SOURCE_DIR" || paths_overlap "$BACKUP_ROOT" "$DEPLOY_DIR"; then
+  die 'backup directory may not overlap source or deployment directories'
+fi
+if path_is_within "$LOCK_FILE" "$SOURCE_DIR" || path_is_within "$LOCK_FILE" "$DEPLOY_DIR" || path_is_within "$LOCK_FILE" "$BACKUP_ROOT"; then
+  die 'lock file may not be inside source, deployment, or backup directories'
+fi
 [[ -d "$SOURCE_DIR/.git" ]] || die 'GITHUB_WORKSPACE must be a Git checkout'
 [[ -d "$DEPLOY_DIR" ]] || die "deployment directory does not exist: $DEPLOY_DIR"
 [[ "$HEALTH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || die 'ARFEEN_HEALTH_ATTEMPTS must be a positive integer'
@@ -126,19 +170,15 @@ log "Synchronizing commit $DEPLOY_SHA into production."
 rsync -a --checksum --delete "${RSYNC_EXCLUDES[@]}" "$SOURCE_DIR/" "$DEPLOY_DIR/"
 
 log 'Validating and starting the Docker Compose stack.'
-(
-  cd "$DEPLOY_DIR"
-  sudo docker compose config --quiet
-  sudo docker compose up -d --build --remove-orphans
-)
-
-expected_services="$(cd "$DEPLOY_DIR" && sudo docker compose config --services | LC_ALL=C sort)"
-running_services="$(cd "$DEPLOY_DIR" && sudo docker compose ps --services --status running | LC_ALL=C sort)"
-[[ -n "$expected_services" && "$running_services" == "$expected_services" ]] || die 'not all Compose services are running'
+cd "$DEPLOY_DIR"
+sudo docker compose config --quiet
+sudo docker compose up -d --build --remove-orphans
+verify_compose_services
 
 health_ok=false
 for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt += 1)); do
-  if curl --fail --silent --show-error --max-time 5 "$HEALTH_URL" >/dev/null; then
+  if curl --fail --silent --show-error --max-time 5 "$HEALTH_URL" >/dev/null \
+    && curl --fail --silent --show-error --max-time 5 "$API_HEALTH_URL" >/dev/null; then
     health_ok=true
     break
   fi
@@ -147,6 +187,7 @@ for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt += 1)); do
   fi
 done
 [[ "$health_ok" == true ]] || die "health check failed after $HEALTH_ATTEMPTS attempts"
+verify_compose_services
 
 ROLLBACK_ARMED=false
 log "Deployment succeeded for commit $DEPLOY_SHA."
