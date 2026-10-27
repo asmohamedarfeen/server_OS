@@ -35,6 +35,17 @@ assert_path_absent() {
   [[ ! -e "$path" ]] || fail "path should be absent: $path"
 }
 
+assert_directory_not_symlink() {
+  local path="$1"
+  [[ -d "$path" && ! -L "$path" ]] || fail "expected a real directory: $path"
+}
+
+commit_source_change() {
+  git -C "$SOURCE_DIR" add -A
+  git -C "$SOURCE_DIR" commit -qm 'update test fixture'
+  SOURCE_SHA="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+}
+
 make_fake_commands() {
   local fake_bin="$1"
   mkdir -p "$fake_bin"
@@ -58,7 +69,15 @@ case "$*" in
     printf '%s\n' traefik backend frontend
     ;;
   "compose ps --services --status running")
-    printf '%s\n' traefik backend frontend
+    count=0
+    [[ -f "$MOCK_PS_COUNT" ]] && count="$(cat "$MOCK_PS_COUNT")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$MOCK_PS_COUNT"
+    if [[ "${MOCK_STOP_SERVICES_AFTER_FIRST:-false}" == "true" && "$count" -gt 1 ]]; then
+      printf '%s\n' traefik frontend
+    else
+      printf '%s\n' traefik backend frontend
+    fi
     ;;
   "compose up -d --build --remove-orphans")
     count=0
@@ -80,7 +99,10 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 echo "curl $*" >>"$MOCK_COMMAND_LOG"
-[[ "${MOCK_HEALTH_FAIL:-false}" != "true" ]]
+[[ "${MOCK_HEALTH_FAIL:-false}" != "true" ]] || exit 22
+if [[ "${MOCK_API_HEALTH_FAIL:-false}" == "true" && "$*" == *'/api/health'* ]]; then
+  exit 22
+fi
 EOF
 
   cat >"$fake_bin/flock" <<'EOF'
@@ -96,9 +118,11 @@ setup_case() {
   local name="$1"
   MOCK_FAIL_FIRST_UP=false
   MOCK_HEALTH_FAIL=false
+  MOCK_API_HEALTH_FAIL=false
+  MOCK_STOP_SERVICES_AFTER_FIRST=false
   MOCK_LOCK_FAIL=false
   TEST_GITHUB_SHA=''
-  export MOCK_FAIL_FIRST_UP MOCK_HEALTH_FAIL MOCK_LOCK_FAIL
+  export MOCK_FAIL_FIRST_UP MOCK_HEALTH_FAIL MOCK_API_HEALTH_FAIL MOCK_STOP_SERVICES_AFTER_FIRST MOCK_LOCK_FAIL
   unset TEST_GITHUB_SHA
 
   CASE_ROOT="$TEST_ROOT/$name"
@@ -109,6 +133,7 @@ setup_case() {
   FAKE_BIN="$CASE_ROOT/bin"
   MOCK_COMMAND_LOG="$CASE_ROOT/commands.log"
   MOCK_UP_COUNT="$CASE_ROOT/up-count"
+  MOCK_PS_COUNT="$CASE_ROOT/ps-count"
   OUTPUT_FILE="$CASE_ROOT/output.log"
 
   mkdir -p "$SOURCE_DIR" "$LIVE_DIR/storage" "$BACKUP_ROOT"
@@ -128,10 +153,11 @@ setup_case() {
   SOURCE_SHA="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
 
   make_fake_commands "$FAKE_BIN"
-  export MOCK_COMMAND_LOG MOCK_UP_COUNT
+  export MOCK_COMMAND_LOG MOCK_UP_COUNT MOCK_PS_COUNT
 }
 
 run_deploy() {
+  local output_file="${1:-$OUTPUT_FILE}"
   env \
     PATH="$FAKE_BIN:$PATH" \
     GITHUB_WORKSPACE="$SOURCE_DIR" \
@@ -141,17 +167,27 @@ run_deploy() {
     ARFEEN_LOCK_FILE="$LOCK_FILE" \
     ARFEEN_BACKUP_ROOT="$BACKUP_ROOT" \
     ARFEEN_HEALTH_URL='http://127.0.0.1:8080/' \
+    ARFEEN_API_HEALTH_URL='http://127.0.0.1:8080/api/health' \
     ARFEEN_HEALTH_ATTEMPTS=2 \
     ARFEEN_HEALTH_INTERVAL=0 \
     MOCK_FAIL_FIRST_UP="${MOCK_FAIL_FIRST_UP:-false}" \
     MOCK_HEALTH_FAIL="${MOCK_HEALTH_FAIL:-false}" \
+    MOCK_API_HEALTH_FAIL="${MOCK_API_HEALTH_FAIL:-false}" \
+    MOCK_STOP_SERVICES_AFTER_FIRST="${MOCK_STOP_SERVICES_AFTER_FIRST:-false}" \
     MOCK_LOCK_FAIL="${MOCK_LOCK_FAIL:-false}" \
-    bash "$DEPLOY_SCRIPT" >"$OUTPUT_FILE" 2>&1
+    bash "$DEPLOY_SCRIPT" >"$output_file" 2>&1
 }
 
 pass() {
   TEST_COUNT=$((TEST_COUNT + 1))
   echo "PASS: $1"
+}
+
+run_test() {
+  local name="$1"
+  if [[ -z "${TEST_FILTER:-}" || "$TEST_FILTER" == "$name" ]]; then
+    "$name"
+  fi
 }
 
 test_success_preserves_protected_paths() {
@@ -165,6 +201,35 @@ test_success_preserves_protected_paths() {
   assert_file_contains "$LIVE_DIR/storage/upload.txt" 'persistent upload'
   assert_equals '1' "$(cat "$MOCK_UP_COUNT")" 'Compose should start once'
   pass test_success_preserves_protected_paths
+}
+
+test_incoming_storage_symlink_preserves_directory() {
+  setup_case storage-symlink
+  ln -s /tmp/attacker-target "$SOURCE_DIR/storage"
+  commit_source_change
+
+  run_deploy || fail "storage symlink deployment exited non-zero: $(cat "$OUTPUT_FILE")"
+
+  assert_directory_not_symlink "$LIVE_DIR/storage"
+  assert_file_contains "$LIVE_DIR/storage/upload.txt" 'persistent upload'
+  pass test_incoming_storage_symlink_preserves_directory
+}
+
+test_incoming_storage_file_survives_failed_deploy() {
+  setup_case storage-file-rollback
+  printf '%s\n' 'replacement file' >"$SOURCE_DIR/storage"
+  commit_source_change
+  MOCK_FAIL_FIRST_UP=true
+  export MOCK_FAIL_FIRST_UP
+
+  if run_deploy; then
+    fail 'deployment should fail when Compose fails with an incoming storage file'
+  fi
+
+  assert_directory_not_symlink "$LIVE_DIR/storage"
+  assert_file_contains "$LIVE_DIR/storage/upload.txt" 'persistent upload'
+  assert_equals '2' "$(cat "$MOCK_UP_COUNT")" 'failed deployment should perform exactly one rollback start'
+  pass test_incoming_storage_file_survives_failed_deploy
 }
 
 test_failed_compose_restores_previous_source() {
@@ -204,6 +269,84 @@ test_health_timeout_restores_previous_source() {
   pass test_health_timeout_restores_previous_source
 }
 
+test_api_health_failure_restores_previous_source() {
+  setup_case api-health-failure
+  MOCK_API_HEALTH_FAIL=true
+  export MOCK_API_HEALTH_FAIL
+
+  if run_deploy; then
+    fail 'deployment should fail when the API health endpoint is unavailable'
+  fi
+
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+  assert_file_contains "$LIVE_DIR/storage/upload.txt" 'persistent upload'
+  assert_equals '2' "$(cat "$MOCK_UP_COUNT")" 'API health failure should restart the restored stack once'
+  assert_equals '4' "$(grep -c '^curl ' "$MOCK_COMMAND_LOG")" 'dashboard and API health probes should run on every attempt'
+  pass test_api_health_failure_restores_previous_source
+}
+
+test_service_exit_after_health_probe_restores_previous_source() {
+  setup_case stale-service-status
+  MOCK_STOP_SERVICES_AFTER_FIRST=true
+  export MOCK_STOP_SERVICES_AFTER_FIRST
+
+  if run_deploy; then
+    fail 'deployment should fail when a Compose service exits after the initial status check'
+  fi
+
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+  assert_file_contains "$LIVE_DIR/storage/upload.txt" 'persistent upload'
+  assert_equals '2' "$(cat "$MOCK_UP_COUNT")" 'stale service status should trigger one rollback start'
+  assert_equals '2' "$(cat "$MOCK_PS_COUNT")" 'service state should be checked before and after health probes'
+  pass test_service_exit_after_health_probe_restores_previous_source
+}
+
+test_overlapping_backup_path_is_rejected() {
+  setup_case backup-overlap
+  BACKUP_ROOT="$SOURCE_DIR/backups"
+
+  if run_deploy; then
+    fail 'deployment should reject a backup directory nested inside the source checkout'
+  fi
+
+  grep -Fq 'backup directory may not overlap source or deployment directories' "$OUTPUT_FILE" || fail 'missing unsafe backup-path diagnostic'
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+  assert_path_absent "$LIVE_DIR/new-file.txt"
+  assert_equals '' "$(cat "$MOCK_COMMAND_LOG")" 'unsafe backup path should fail before external services'
+  pass test_overlapping_backup_path_is_rejected
+}
+
+test_lock_path_inside_live_directory_is_rejected() {
+  setup_case lock-overlap
+  LOCK_FILE="$LIVE_DIR/.deploy.lock"
+
+  if run_deploy; then
+    fail 'deployment should reject a lock file inside the live deployment directory'
+  fi
+
+  grep -Fq 'lock file may not be inside source, deployment, or backup directories' "$OUTPUT_FILE" || fail 'missing unsafe lock-path diagnostic'
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+  assert_path_absent "$LIVE_DIR/new-file.txt"
+  assert_path_absent "$LIVE_DIR/.deploy.lock"
+  assert_equals '' "$(cat "$MOCK_COMMAND_LOG")" 'unsafe lock path should fail before external services'
+  pass test_lock_path_inside_live_directory_is_rejected
+}
+
+test_root_alias_is_rejected() {
+  setup_case root-alias
+  BACKUP_ROOT='//'
+
+  if run_deploy; then
+    fail 'deployment should reject a canonical filesystem-root backup path'
+  fi
+
+  grep -Fq 'ARFEEN_BACKUP_ROOT may not be the filesystem root' "$OUTPUT_FILE" || fail 'missing canonical root-path diagnostic'
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+  assert_path_absent "$LIVE_DIR/new-file.txt"
+  assert_equals '' "$(cat "$MOCK_COMMAND_LOG")" 'root alias should fail before external services'
+  pass test_root_alias_is_rejected
+}
+
 test_lock_prevents_concurrent_deploy() {
   setup_case lock-contention
   MOCK_LOCK_FAIL=true
@@ -218,6 +361,57 @@ test_lock_prevents_concurrent_deploy() {
   assert_equals '' "$(cat "$MOCK_COMMAND_LOG")" 'locked deployment should not call external services'
   unset MOCK_LOCK_FAIL
   pass test_lock_prevents_concurrent_deploy
+}
+
+test_real_flock_rejects_second_process() {
+  local system_flock
+  system_flock="$(PATH='/usr/bin:/bin' command -v flock 2>/dev/null || true)"
+  if [[ -z "$system_flock" ]]; then
+    echo 'SKIP: test_real_flock_rejects_second_process (flock unavailable on this host)'
+    return
+  fi
+
+  setup_case real-lock-contention
+  rm -f -- "$FAKE_BIN/flock"
+  LOCK_ENTERED="$CASE_ROOT/lock-entered"
+  LOCK_RELEASE="$CASE_ROOT/lock-release"
+  export LOCK_ENTERED LOCK_RELEASE
+
+  cat >"$FAKE_BIN/mktemp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+created="$(/usr/bin/mktemp "$@")"
+printf '%s\n' "$created"
+touch "$LOCK_ENTERED"
+while [[ ! -e "$LOCK_RELEASE" ]]; do
+  sleep 0.05
+done
+EOF
+  chmod +x "$FAKE_BIN/mktemp"
+
+  first_output="$CASE_ROOT/first-output.log"
+  second_output="$CASE_ROOT/second-output.log"
+  run_deploy "$first_output" &
+  first_pid=$!
+
+  for _ in $(seq 1 100); do
+    [[ -e "$LOCK_ENTERED" ]] && break
+    sleep 0.05
+  done
+  [[ -e "$LOCK_ENTERED" ]] || fail 'first deployment did not reach the locked section'
+
+  if run_deploy "$second_output"; then
+    touch "$LOCK_RELEASE"
+    wait "$first_pid" || true
+    fail 'second deployment should fail while the real flock is held'
+  fi
+  grep -Fq 'another production deployment is already running' "$second_output" || fail 'second deployment did not report lock contention'
+  assert_file_contains "$LIVE_DIR/README.md" 'old source'
+
+  touch "$LOCK_RELEASE"
+  wait "$first_pid" || fail "first deployment failed after lock release: $(cat "$first_output")"
+  assert_file_contains "$LIVE_DIR/README.md" 'new source'
+  pass test_real_flock_rejects_second_process
 }
 
 test_sha_mismatch_stops_before_sync() {
@@ -269,11 +463,19 @@ test_workflow_contract() {
 
 [[ -f "$DEPLOY_SCRIPT" ]] || fail "missing deployment script: $DEPLOY_SCRIPT"
 
-test_success_preserves_protected_paths
-test_failed_compose_restores_previous_source
-test_health_timeout_restores_previous_source
-test_lock_prevents_concurrent_deploy
-test_sha_mismatch_stops_before_sync
-test_workflow_contract
+run_test test_success_preserves_protected_paths
+run_test test_incoming_storage_symlink_preserves_directory
+run_test test_incoming_storage_file_survives_failed_deploy
+run_test test_failed_compose_restores_previous_source
+run_test test_health_timeout_restores_previous_source
+run_test test_api_health_failure_restores_previous_source
+run_test test_service_exit_after_health_probe_restores_previous_source
+run_test test_lock_prevents_concurrent_deploy
+run_test test_real_flock_rejects_second_process
+run_test test_overlapping_backup_path_is_rejected
+run_test test_lock_path_inside_live_directory_is_rejected
+run_test test_root_alias_is_rejected
+run_test test_sha_mismatch_stops_before_sync
+run_test test_workflow_contract
 
 echo "All $TEST_COUNT deployment tests passed."
