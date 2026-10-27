@@ -31,6 +31,7 @@ services:
       STORAGE_DIR: /data/files
       JWT_SECRET: ${JWT_SECRET:?Run ./scripts/install.sh to generate secrets}
       SETUP_TOKEN: ${SETUP_TOKEN:?Run ./scripts/install.sh to generate secrets}
+      GITHUB_CREDENTIALS_KEY: ${GITHUB_CREDENTIALS_KEY:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

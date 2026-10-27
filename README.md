@@ -211,11 +211,11 @@ From the Mac, create and copy a new archive using the commands in step 4. The ar
 ```bash
 cd "$HOME/arfeen-cloud"
 tar -xzf /tmp/arfeen-cloud.tar.gz -C "$HOME/arfeen-cloud"
-sudo docker compose up -d --build
+sudo ./scripts/install.sh
 sudo docker compose ps
 ```
 
-The named `arfeen_data` Docker volume and the server’s `storage/` directory are preserved when the stack is rebuilt or stopped with `docker compose down`.
+The installer preserves existing `.env` secrets and adds `GITHUB_CREDENTIALS_KEY` if it is missing. The named `arfeen_data` Docker volume and the server’s `storage/` directory are preserved when the stack is rebuilt or stopped with `docker compose down`.
 
 ## Useful server commands
 
@@ -255,16 +255,26 @@ Then run `sudo docker compose up -d` and open `http://<ubuntu-lan-ip>:8080` from
 - Single administrator setup and sign-in with an Argon2 password hash and HTTP-only session cookie.
 - Host CPU, memory, disk, network, process count, uptime, and temperature metrics.
 - Docker container lifecycle controls, logs, image and volume views, networks, and browser terminal.
-- Public GitHub HTTPS and ZIP deployments, framework detection, image builds, environment variables, redeploy, and rollback.
+- Public and private GitHub repository and ZIP deployments, branch selection, framework detection, image builds, environment variables, redeploy, and rollback.
 - PostgreSQL, MySQL, and Redis containers with persistent Docker volumes on a private network.
 - File uploads, downloads, folder creation, rename, and delete in the project’s `storage/` directory.
 
 ## Important security and MVP notes
 
 - The backend has Docker socket access and a host filesystem mount for the requested root terminal. The dashboard can perform host-level administration. Keep access restricted to your trusted Tailscale devices.
-- Arfeen stores its SQLite metadata and deployment environment values in a Docker volume. Database passwords are shown once when created. Back up the `.env` file, the `arfeen_data` Docker volume, and `storage/`.
-- Git deployment currently supports public GitHub HTTPS URLs. Private GitHub authentication, webhook builds, automatic public-domain certificate issuance, scheduled backups, and plugin installation are not implemented.
+- Arfeen stores its SQLite metadata, encrypted GitHub token, and deployment environment values in a Docker volume. The key used to encrypt the GitHub token is in `.env`; back up `.env`, the `arfeen_data` Docker volume, and `storage/` together. Database passwords are shown once when created.
+- GitHub builds start from the dashboard. Automatic deploys on every push, GitHub webhooks, automatic public-domain certificate issuance, scheduled backups, and plugin installation are not implemented.
 - The current guide provides private remote access through Tailscale. Making the dashboard publicly accessible to any browser through a custom domain requires a separate HTTPS and firewall configuration; do not expose the current HTTP port directly.
+
+## Deploying a private GitHub repository
+
+1. In GitHub, create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new). Limit repository access to the repositories Arfeen Cloud should deploy. Grant **Contents: Read-only**; GitHub also requires **Metadata: Read-only** to list repositories and branches. If GitHub asks for organization approval, complete that approval before connecting.
+2. Update Arfeen Cloud using the instructions in **Updating Arfeen Cloud**. The installer adds `GITHUB_CREDENTIALS_KEY` to an existing `.env` file when needed. Keep this key stable: changing or losing it makes the saved token unreadable.
+3. Sign in to Arfeen Cloud, open **Settings → GitHub**, paste the token, and choose **Connect GitHub**. Arfeen validates the token before saving it encrypted in its database. The browser does not receive the saved token back.
+4. Open **Applications → Deploy application → GitHub → Connected repositories**. Select a repository and branch, enter the application name and any environment variables, then choose **Build and deploy**.
+5. Use **Redeploy** on the application card to fetch and deploy the latest commit from that same branch. Pushes do not deploy automatically in this version.
+
+To revoke access, disconnect GitHub in Settings and revoke the token in GitHub. Existing containers keep running; private repository redeploys need a connected token.
 
 ## References
 
@@ -273,3 +283,4 @@ Then run `sudo docker compose up -d` and open `http://<ubuntu-lan-ip>:8080` from
 - [Install Tailscale on macOS](https://tailscale.com/docs/install/mac)
 - [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)
 - [Enable HTTPS certificates for a tailnet](https://tailscale.com/docs/how-to/set-up-https-certificates)
+- [GitHub fine-grained personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)

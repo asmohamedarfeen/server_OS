@@ -26,6 +26,8 @@ export type AppRecord = {
   id: string;
   name: string;
   source: string;
+  source_type?: "github" | "github-private" | "zip";
+  source_ref?: string;
   framework: string;
   port: number;
   host_port: number | null;

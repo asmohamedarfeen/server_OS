@@ -17,11 +17,13 @@ fi
 if [[ ! -f "$ENV_FILE" ]]; then
   JWT_VALUE="$(openssl rand -hex 32)"
   SETUP_VALUE="$(openssl rand -hex 24)"
+  GITHUB_KEY_VALUE="$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '\n')"
   cat > "$ENV_FILE" <<EOF
 CLOUD_BIND=127.0.0.1
 CLOUD_PORT=8080
 JWT_SECRET=$JWT_VALUE
 SETUP_TOKEN=$SETUP_VALUE
+GITHUB_CREDENTIALS_KEY=$GITHUB_KEY_VALUE
 COOKIE_SECURE=false
 EOF
   chmod 600 "$ENV_FILE"
@@ -32,6 +34,13 @@ EOF
   echo
 else
   echo "Using existing $ENV_FILE. Existing secrets were not changed."
+fi
+
+if ! grep -q '^GITHUB_CREDENTIALS_KEY=' "$ENV_FILE"; then
+  GITHUB_KEY_VALUE="$(openssl rand -base64 32 | tr '/+' '_-' | tr -d '\n')"
+  printf '\nGITHUB_CREDENTIALS_KEY=%s\n' "$GITHUB_KEY_VALUE" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "Added a dedicated GitHub credential encryption key to $ENV_FILE"
 fi
 
 cd "$ROOT_DIR"

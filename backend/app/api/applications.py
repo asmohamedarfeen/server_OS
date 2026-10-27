@@ -1,8 +1,10 @@
 import json
+import os
 import re
 import shutil
 import subprocess
 import uuid
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,10 +16,38 @@ from ..core.auth import get_current_user
 from ..core.config import WORKSPACE_DIR
 from ..core.db import connection
 from ..services.docker_engine import client
+from ..services.github import GitHubError, github_token
 
 router = APIRouter(prefix="/api/apps", tags=["applications"], dependencies=[Depends(get_current_user)])
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+def record_deployment_attempt(attempt_id: str, source: str, source_ref: str, status: str, stage: str, message: str, app_id: str | None = None, image: str | None = None):
+    with connection() as db:
+        db.execute(
+            "INSERT INTO deployment_attempts(id,app_id,source,source_ref,status,stage,message,created_at,image) VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET app_id=excluded.app_id,source=excluded.source,source_ref=excluded.source_ref,status=excluded.status,stage=excluded.stage,message=excluded.message,image=excluded.image",
+            (attempt_id, app_id, source, source_ref, status, stage, message[:2000], now(), image),
+        )
+
+def mark_attempt(attempt: dict, status: str, stage: str, message: str, app_id: str | None = None, image: str | None = None):
+    attempt["stage"] = stage
+    if app_id is not None:
+        attempt["app_id"] = app_id
+    if image is not None:
+        attempt["image"] = image
+    record_deployment_attempt(attempt["id"], attempt["source"], attempt["ref"], status, stage, message, attempt.get("app_id"), attempt.get("image"))
+
+def safe_deployment_error(exc: Exception, token: str | None = None, environment: dict | None = None) -> str:
+    message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+    message = message if isinstance(message, str) else "Deployment failed"
+    secrets_to_hide = [token] if token else []
+    if isinstance(environment, dict):
+        secrets_to_hide.extend(value for value in environment.values() if isinstance(value, str) and value)
+    for secret in secrets_to_hide:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    return message[:2000]
 
 def detect_framework(root: Path):
     names = {p.name for p in root.iterdir()}
@@ -73,7 +103,29 @@ def safe_name(value):
     if not slug: raise HTTPException(400, "Choose a valid application name")
     return slug
 
-def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json: str = "{}"):
+def valid_branch_ref(value):
+    if not isinstance(value, str) or not value or len(value) > 255 or value.startswith("-") or value.endswith(("/", ".")) or ".." in value or "@{" in value or value == "@":
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 or char in " ~^:?*[" or char == "\\" for char in value):
+        return False
+    return all(part and not part.startswith(".") and not part.endswith(".lock") for part in value.split("/"))
+
+def canonical_github_url(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"} or parsed.username or parsed.password or port:
+        return None
+    match = re.fullmatch(r"/([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100})(?:\.git)?/?", parsed.path)
+    if not match:
+        return None
+    return f"https://github.com/{match.group(1)}/{match.group(2)}.git"
+
+def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json: str = "{}", source_type: str = "github", source_ref: str = "", attempt: dict | None = None):
     if domain and (len(domain) > 253 or not re.fullmatch(r"(?=.{1,253}$)([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", domain)):
         raise HTTPException(400, "Enter a valid hostname")
     try:
@@ -81,9 +133,13 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
         if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()): raise ValueError()
     except (TypeError, ValueError):
         raise HTTPException(400, "Environment variables must be a JSON object of string values")
+    if attempt:
+        mark_attempt(attempt, "running", "detect", "Detecting application framework")
     framework, port, kind = detect_framework(root)
     generated_dockerfile(root, kind, framework, port)
     app_id = str(uuid.uuid4())
+    if attempt:
+        mark_attempt(attempt, "running", "build", "Building the application image", app_id)
     safe = safe_name(name)
     with connection() as db:
         if db.execute("SELECT 1 FROM applications WHERE name=?",(safe,)).fetchone():
@@ -115,14 +171,18 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     if domain:
         kwargs["labels"].update({"traefik.enable": "true", "traefik.http.routers." + safe + ".rule": f"Host(`{domain}`)", "traefik.http.routers." + safe + ".entrypoints": "web", "traefik.http.services." + safe + ".loadbalancer.server.port": str(port)})
         kwargs["ports"] = None
+    if attempt:
+        mark_attempt(attempt, "running", "deploy", "Starting the application container", app_id, image_tag)
     container = docker.containers.run(**kwargs)
     for network_name in networks:
         try: docker.networks.get(network_name).connect(container)
         except docker.errors.NotFound: pass
     with connection() as db:
-        db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, "running", container.id, image_tag, domain, now(), env_json))
+        db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json,source_type,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, "running", container.id, image_tag, domain, now(), env_json, source_type, source_ref))
         db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), app_id, "success", "Build and deployment completed", now(), image_tag))
-    return {"id": app_id, "name": safe, "source": source, "framework": framework, "port": port, "host_port": host_port, "status": "running", "container_id": container.short_id, "image": image_tag, "domain": domain, "url": f"http://{domain}" if domain else f"http://SERVER-IP:{host_port}"}
+    if attempt:
+        mark_attempt(attempt, "success", "complete", "Build and deployment completed", app_id, image_tag)
+    return {"id": app_id, "name": safe, "source": source, "source_type": source_type, "source_ref": source_ref, "framework": framework, "port": port, "host_port": host_port, "status": "running", "container_id": container.short_id, "image": image_tag, "domain": domain, "url": f"http://{domain}" if domain else f"http://SERVER-IP:{host_port}"}
 
 @router.get("")
 def list_apps():
@@ -131,6 +191,8 @@ def list_apps():
     result = []
     for row in rows:
         value = dict(row)
+        if value.get("source_type", "github").startswith("github"):
+            value["source"] = canonical_github_url(value.get("source")) or "GitHub repository"
         try:
             container=client().containers.get(value["container_id"])
             value["status"] = container.status
@@ -142,20 +204,96 @@ def list_apps():
 
 @router.post("/github")
 def deploy_github(body: dict):
-    url = body.get("url", "")
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
-        raise HTTPException(400, "Only HTTPS GitHub repository URLs are supported")
-    name = safe_name(body.get("name") or Path(parsed.path.rstrip("/")).stem)
+    owner, repo, ref = body.get("owner"), body.get("repo"), body.get("ref", "")
+    if ref is None:
+        ref = ""
+    source_type = "github"
+    token = None
+    if owner is not None or repo is not None:
+        segment = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+        if not isinstance(owner, str) or not segment.fullmatch(owner) or not isinstance(repo, str) or not segment.fullmatch(repo):
+            raise HTTPException(400, "Choose a valid GitHub owner and repository")
+        if not valid_branch_ref(ref):
+            raise HTTPException(400, "Choose a valid branch")
+        try:
+            token = github_token()
+        except GitHubError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if not token:
+            raise HTTPException(409, "Connect a GitHub token in Settings before deploying a private repository")
+        url = f"https://github.com/{owner}/{repo}.git"
+        source_type = "github-private"
+    else:
+        url = body.get("url", "")
+        if not isinstance(url, str):
+            raise HTTPException(400, "Enter a GitHub repository URL")
+        try:
+            parsed = urlparse(url)
+            port = parsed.port
+        except ValueError as exc:
+            raise HTTPException(400, "Enter a valid GitHub repository URL") from exc
+        if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"} or parsed.username or parsed.password or port or parsed.query or parsed.fragment:
+            raise HTTPException(400, "Only plain HTTPS GitHub repository URLs are supported")
+        match = re.fullmatch(r"/([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100})(?:\.git)?/?", parsed.path)
+        if not match:
+            raise HTTPException(400, "Enter a GitHub repository URL in owner/repository format")
+        if ref and not valid_branch_ref(ref):
+            raise HTTPException(400, "Choose a valid branch")
+        url = f"https://github.com/{match.group(1)}/{match.group(2)}.git"
+    app_name = body.get("name") or Path(urlparse(url).path.rstrip("/")).stem.removesuffix(".git")
+    if not isinstance(app_name, str):
+        raise HTTPException(400, "Enter a valid application name")
+    domain = body.get("domain") or None
+    if domain is not None and not isinstance(domain, str):
+        raise HTTPException(400, "Enter a valid hostname")
+    name = safe_name(app_name)
     source_dir = WORKSPACE_DIR / str(uuid.uuid4())
     source_dir.mkdir(parents=True)
-    result = subprocess.run(["git", "clone", "--depth", "1", "--", url.removesuffix(".git"), str(source_dir)], capture_output=True, text=True, timeout=180)
-    if result.returncode:
-        shutil.rmtree(source_dir, ignore_errors=True)
-        raise HTTPException(400, f"Git clone failed: {result.stderr[-1500:]}")
+    attempt = {"id": str(uuid.uuid4()), "source": url, "ref": ref, "stage": "clone"}
+    mark_attempt(attempt, "running", "clone", "Fetching repository source")
+    environment = body.get("environment", {})
     try:
-        return deploy_tree(name, url, source_dir, body.get("domain"), json.dumps(body.get("environment", {})))
+        clone_github_repository(url, ref, source_dir, token)
+        return deploy_tree(name, url, source_dir, domain, json.dumps(environment), source_type, ref, attempt)
+    except Exception as exc:
+        detail = safe_deployment_error(exc, token, environment)
+        mark_attempt(attempt, "failed", attempt["stage"], detail or "Deployment failed")
+        if isinstance(exc, GitHubError):
+            raise HTTPException(400, detail) from exc
+        if isinstance(exc, HTTPException):
+            if detail == exc.detail:
+                raise
+            raise HTTPException(exc.status_code, detail) from exc
+        raise HTTPException(500, f"Deployment failed during {attempt['stage']}. Check deployment history.") from exc
     finally: shutil.rmtree(source_dir, ignore_errors=True)
+
+
+def clone_github_repository(url: str, ref: str, destination: Path, token: str | None = None):
+    command = ["git", "clone", "--depth", "1", "--single-branch"]
+    if ref:
+        command.append(f"--branch={ref}")
+    command.extend(["--", url, str(destination)])
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    helper_dir = None
+    try:
+        if token:
+            helper_dir = tempfile.TemporaryDirectory(prefix="arfeen-git-askpass-")
+            helper = Path(helper_dir.name) / "askpass"
+            helper.write_text("#!/bin/sh\ncase \"$1\" in\n  *'https://github.com:'*|*'https://github.com/'*|*'https://www.github.com:'*|*'https://www.github.com/'*) ;;\n  *) exit 1 ;;\nesac\ncase \"$1\" in\n  *sername*) printf '%s\\n' x-access-token ;;\n  *assword*) printf '%s\\n' \"$ARFEEN_GITHUB_TOKEN\" ;;\n  *) exit 1 ;;\nesac\n")
+            helper.chmod(0o700)
+            environment["GIT_ASKPASS"] = str(helper)
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            environment["ARFEEN_GITHUB_TOKEN"] = token
+        result = subprocess.run(command, capture_output=True, text=True, timeout=180, env=environment)
+        if result.returncode:
+            detail = result.stderr.replace(token, "[redacted]") if token else result.stderr
+            raise GitHubError(f"GitHub clone failed: {detail[-1200:].strip() or 'check repository access and branch name'}")
+    except subprocess.TimeoutExpired as exc:
+        raise GitHubError("GitHub clone timed out after 180 seconds.") from exc
+    finally:
+        if helper_dir:
+            helper_dir.cleanup()
 
 @router.post("/zip")
 async def deploy_zip(file: UploadFile = File(...), name: str = Form(...), domain: str = Form(""), environment: str = Form("{}")):
@@ -196,15 +334,17 @@ async def deploy_zip(file: UploadFile = File(...), name: str = Form(...), domain
     children = list(extracted.iterdir())
     root = children[0] if len(children) == 1 and children[0].is_dir() else extracted
     try:
-        return deploy_tree(name, "ZIP upload", root, domain or None, environment)
+        return deploy_tree(name, "ZIP upload", root, domain or None, environment, "zip", "")
     finally: shutil.rmtree(source_dir, ignore_errors=True)
 
-def redeploy_tree(app_id: str, root: Path, source: str):
+def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = None):
     with connection() as db: row=db.execute("SELECT * FROM applications WHERE id=?",(app_id,)).fetchone()
     if not row: raise HTTPException(404,"Application not found")
+    if attempt: mark_attempt(attempt,"running","detect","Detecting application framework",app_id)
     framework,port,kind=detect_framework(root)
     generated_dockerfile(root,kind,framework,port)
     build_id=str(uuid.uuid4()); image_tag=f"arfeen/{row['name']}:{build_id[:8]}"; docker=client()
+    if attempt: mark_attempt(attempt,"running","build","Building the replacement image",app_id)
     try: image,_=docker.images.build(path=str(root),tag=image_tag,rm=True,pull=True)
     except BuildError as exc:
         detail="\n".join(x.get("stream","") for x in exc.build_log if x.get("stream"))[-6000:]
@@ -215,36 +355,60 @@ def redeploy_tree(app_id: str, root: Path, source: str):
     if row["domain"]:
         labels.update({"traefik.enable":"true",f"traefik.http.routers.{row['name']}.rule":f"Host(`{row['domain']}`)",f"traefik.http.routers.{row['name']}.entrypoints":"web",f"traefik.http.services.{row['name']}.loadbalancer.server.port":str(port)})
     previous_image=row["image"]
+    replacement=None
+    if attempt: mark_attempt(attempt,"running","deploy","Starting the replacement container",app_id,image_tag)
     try:
-        if old:
-            if old.status=="running": old.stop(timeout=10)
-            old.remove()
-        replacement=docker.containers.run(image.id,name=f"arfeen-{row['name']}-{build_id[:8]}",detach=True,environment=json.loads(row["env_json"] or "{}"),labels=labels,ports=({f"{port}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
+        if old and old.status=="running": old.stop(timeout=10)
+        replacement=docker.containers.create(image.id,name=f"arfeen-{row['name']}-{build_id[:8]}",environment=json.loads(row["env_json"] or "{}"),labels=labels,ports=({f"{port}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
         if row["domain"]:
-            try: docker.networks.get("arfeen_proxy").connect(replacement)
-            except docker.errors.NotFound: pass
+            docker.networks.get("arfeen_proxy").connect(replacement)
+        replacement.start()
     except Exception as exc:
+        if replacement:
+            try: replacement.remove(force=True)
+            except Exception: pass
         if old and old_state=="running":
             try: old.start()
             except Exception: pass
         raise HTTPException(400,f"Could not start the new deployment: {exc}")
+    if old:
+        try: old.remove()
+        except Exception: pass
     with connection() as db:
         db.execute("UPDATE applications SET source=?,framework=?,port=?,container_id=?,image=?,status='running' WHERE id=?",(source,framework,port,replacement.id,image_tag,app_id))
         db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)",(build_id,app_id,"success",f"Redeployed {framework}",now(),image_tag))
+    if attempt: mark_attempt(attempt,"success","complete",f"Redeployed {framework}",app_id,image_tag)
     return {"id":app_id,"name":row["name"],"framework":framework,"image":image_tag,"status":"running","previous_image":previous_image}
 
 @router.post("/{app_id}/redeploy/github")
 def redeploy_github(app_id: str):
-    with connection() as db: row=db.execute("SELECT source FROM applications WHERE id=?",(app_id,)).fetchone()
+    with connection() as db: row=db.execute("SELECT source,source_type,source_ref,name FROM applications WHERE id=?",(app_id,)).fetchone()
     if not row: raise HTTPException(404,"Application not found")
-    parsed=urlparse(row["source"])
-    if parsed.scheme!="https" or parsed.hostname not in {"github.com","www.github.com"}:
-        raise HTTPException(409,"This application was not deployed from a public GitHub URL")
+    safe_source=canonical_github_url(row["source"])
+    if row["source_type"] not in ("github", "github-private") or not safe_source:
+        raise HTTPException(409,"This application was not deployed from a GitHub repository")
     source_dir=WORKSPACE_DIR/str(uuid.uuid4());source_dir.mkdir(parents=True)
+    attempt={"id":str(uuid.uuid4()),"source":safe_source,"ref":row["source_ref"] or "","stage":"clone","app_id":app_id}
+    mark_attempt(attempt,"running","clone","Fetching repository source",app_id)
     try:
-        result=subprocess.run(["git","clone","--depth","1","--",row["source"].removesuffix(".git"),str(source_dir)],capture_output=True,text=True,timeout=180)
-        if result.returncode: raise HTTPException(400,f"Git clone failed: {result.stderr[-1500:]}")
-        return redeploy_tree(app_id,source_dir,row["source"])
+        token = None
+        if row["source_type"] == "github-private":
+            try: token=github_token()
+            except GitHubError as exc: raise HTTPException(503,str(exc)) from exc
+            if not token: raise HTTPException(409,"Reconnect GitHub in Settings before redeploying this private repository")
+        try: clone_github_repository(safe_source,row["source_ref"] or "",source_dir,token)
+        except GitHubError as exc: raise HTTPException(400,str(exc)) from exc
+        return redeploy_tree(app_id,source_dir,safe_source,attempt)
+    except Exception as exc:
+        try: environment=json.loads(row["env_json"] or "{}")
+        except Exception: environment={}
+        detail=safe_deployment_error(exc,token if "token" in locals() else None,environment)
+        mark_attempt(attempt,"failed",attempt["stage"],detail or "Redeploy failed",app_id)
+        if isinstance(exc,HTTPException):
+            if detail == exc.detail: raise
+            raise HTTPException(exc.status_code,detail) from exc
+        if isinstance(exc,GitHubError): raise HTTPException(400,detail) from exc
+        raise HTTPException(500,f"Redeploy failed during {attempt['stage']}. Check deployment history.") from exc
     finally: shutil.rmtree(source_dir,ignore_errors=True)
 
 @router.post("/{app_id}/redeploy/zip")
@@ -276,7 +440,14 @@ async def redeploy_zip(app_id: str,file: UploadFile=File(...)):
 @router.get("/{app_id}/deployments")
 def deployment_history(app_id: str):
     with connection() as db:
-        return [dict(r) for r in db.execute("SELECT * FROM deployments WHERE app_id=? ORDER BY created_at DESC", (app_id,)).fetchall()]
+        successful = [dict(r) for r in db.execute("SELECT * FROM deployments WHERE app_id=?", (app_id,)).fetchall()]
+        failed = [dict(r) for r in db.execute("SELECT id,app_id,status,message,created_at,image,stage FROM deployment_attempts WHERE app_id=? AND status='failed'", (app_id,)).fetchall()]
+    return sorted(successful + failed, key=lambda item: item["created_at"], reverse=True)
+
+@router.get("/deployment-attempts")
+def failed_deployment_attempts():
+    with connection() as db:
+        return [dict(row) for row in db.execute("SELECT a.id,a.app_id,a.source,a.source_ref,a.status,a.stage,a.message,a.created_at,a.image,ap.name AS app_name FROM deployment_attempts a LEFT JOIN applications ap ON ap.id=a.app_id WHERE a.status='failed' AND ap.id IS NULL ORDER BY a.created_at DESC LIMIT 200").fetchall()]
 
 @router.get("/{app_id}/environment")
 def get_environment(app_id: str):

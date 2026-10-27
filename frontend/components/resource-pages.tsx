@@ -397,7 +397,7 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
     }
   }
   async function redeploy(app: AppRecord) {
-    if (app.source.startsWith("https://github.com/") || app.source.startsWith("https://www.github.com/")) {
+    if (app.source_type === "github-private" || app.source_type === "github" || app.source.startsWith("https://github.com/") || app.source.startsWith("https://www.github.com/")) {
       try {
         await api(`/apps/${app.id}/redeploy/github`, { method: "POST" });
         notify(`${app.name} redeployed`);
@@ -496,7 +496,7 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
                 </div>
                 <h2>{app.name}</h2>
                 <p>
-                  {app.framework} · {app.source}
+                  {app.framework} · {app.source_type === "github-private" ? `${app.source} · ${app.source_ref || "default branch"}` : app.source}
                 </p>
                 <div className="app-card-url">
                   <span>
@@ -591,10 +591,15 @@ export function DeploymentsPage({ notify }: { notify: Props["notify"] }) {
             items: await api<any[]>(`/apps/${app.id}/deployments`).catch(() => []),
           })),
         );
+        const unassignedFailures = await api<any[]>("/apps/deployment-attempts").catch(() => []);
         setItems(
-          histories
-            .flatMap((x) => x.items.map((deployment: any) => ({ ...deployment, app: x.app })))
-            .sort((a, b) => b.created_at.localeCompare(a.created_at)),
+          [
+            ...histories.flatMap((x) => x.items.map((deployment: any) => ({ ...deployment, app: x.app }))),
+            ...unassignedFailures.map((attempt: any) => ({
+              ...attempt,
+              app: { id: attempt.app_id || "", name: attempt.app_name || attempt.source },
+            })),
+          ].sort((a, b) => b.created_at.localeCompare(a.created_at)),
         );
       })
       .catch((e) => notify(e.message, "error"))
@@ -662,9 +667,9 @@ export function DeploymentsPage({ notify }: { notify: Props["notify"] }) {
                     <td>{new Date(item.created_at).toLocaleString()}</td>
                     <td className="mono-cell">{item.image}</td>
                     <td>
-                      <button className="row-action-button" onClick={() => rollback(item.app)}>
+                      {item.status === "success" ? <button className="row-action-button" onClick={() => rollback(item.app)}>
                         <RotateCcw size={13} /> Roll back
-                      </button>
+                      </button> : <span className="mono-cell">{item.stage || "failed"}</span>}
                     </td>
                   </tr>
                 ))}
@@ -704,21 +709,66 @@ function DeployModal({
   const [tab, setTab] = useState("github"),
     [name, setName] = useState(""),
     [url, setUrl] = useState(""),
+    [githubConnected, setGithubConnected] = useState(false),
+    [githubMode, setGithubMode] = useState<"repository" | "public-url">("repository"),
+    [repositories, setRepositories] = useState<any[]>([]),
+    [repositorySearch, setRepositorySearch] = useState(""),
+    [repositoryKey, setRepositoryKey] = useState(""),
+    [branches, setBranches] = useState<any[]>([]),
+    [branch, setBranch] = useState(""),
+    [publicBranch, setPublicBranch] = useState(""),
+    [branchesLoading, setBranchesLoading] = useState(false),
     [domain, setDomain] = useState(""),
     [file, setFile] = useState<File | null>(null),
     [envText, setEnvText] = useState(""),
     [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api<{ connected: boolean }>("/github/connection")
+      .then(async (status) => {
+        setGithubConnected(status.connected);
+        if (status.connected) setRepositories(await api<any[]>("/github/repositories"));
+      })
+      .catch((e) => notify(e instanceof Error ? e.message : "GitHub status unavailable", "error"));
+  }, []);
+  const selectedRepository = repositories.find((repo) => repo.full_name === repositoryKey);
+  useEffect(() => {
+    let active = true;
+    if (!selectedRepository) {
+      setBranches([]);
+      setBranch("");
+      setBranchesLoading(false);
+      return () => { active = false; };
+    }
+    setBranches([]);
+    setBranch("");
+    setBranchesLoading(true);
+    api<any[]>(`/github/repositories/${encodeURIComponent(selectedRepository.owner)}/${encodeURIComponent(selectedRepository.name)}/branches`)
+      .then((values) => {
+        if (!active) return;
+        setBranches(values);
+        setBranch(values.some((entry) => entry.name === selectedRepository.default_branch) ? selectedRepository.default_branch : (values[0]?.name || ""));
+      })
+      .catch((e) => { if (active) notify(e instanceof Error ? e.message : "Could not load repository branches", "error"); })
+      .finally(() => { if (active) setBranchesLoading(false); });
+    return () => { active = false; };
+  }, [repositoryKey, repositories]);
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     try {
       const environment = parseEnvironment(envText);
-      if (tab === "github")
+      if (tab === "github" && githubMode === "repository") {
+        if (!selectedRepository || !branch || branchesLoading) throw new Error("Choose a repository and branch");
         await api("/apps/github", {
           method: "POST",
-          body: JSON.stringify({ name, url, domain: domain || null, environment }),
+          body: JSON.stringify({ name, owner: selectedRepository.owner, repo: selectedRepository.name, ref: branch, domain: domain || null, environment }),
         });
-      else {
+      } else if (tab === "github") {
+        await api("/apps/github", {
+          method: "POST",
+          body: JSON.stringify({ name, url, ref: publicBranch, domain: domain || null, environment }),
+        });
+      } else {
         if (!file) throw new Error("Choose a ZIP archive first");
         const data = new FormData();
         data.set("file", file);
@@ -756,16 +806,49 @@ function DeployModal({
           />
         </label>
         {tab === "github" ? (
-          <label>
-            Repository URL
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://github.com/owner/repository"
-              required
-              type="url"
-            />
-          </label>
+          githubConnected && githubMode === "repository" ? (
+            <>
+              <div className="github-source-switch">
+                <button type="button" className="selected" onClick={() => setGithubMode("repository")}>Connected repositories</button>
+                <button type="button" onClick={() => setGithubMode("public-url")}>Public URL</button>
+              </div>
+              <label>
+                Find repository
+                <input value={repositorySearch} onChange={(e) => setRepositorySearch(e.target.value)} placeholder="Search accessible repositories" />
+              </label>
+              <label>
+                Repository
+                <select value={repositoryKey} onChange={(e) => setRepositoryKey(e.target.value)} required>
+                  <option value="">Select a repository</option>
+                  {repositories.filter((repo) => repo.full_name.toLowerCase().includes(repositorySearch.toLowerCase())).map((repo) => (
+                    <option key={repo.full_name} value={repo.full_name}>{repo.full_name}{repo.private ? " · private" : ""}</option>
+                  ))}
+                </select>
+              </label>
+              {selectedRepository && <label>
+                Branch
+                <select value={branch} onChange={(e) => setBranch(e.target.value)} disabled={branchesLoading || branches.length === 0} required>
+                  {branchesLoading ? <option value="">Loading branches…</option> : branches.map((entry) => <option key={entry.name} value={entry.name}>{entry.name}</option>)}
+                </select>
+              </label>}
+            </>
+          ) : (
+            <>
+              {githubConnected && <div className="github-source-switch">
+                <button type="button" onClick={() => setGithubMode("repository")}>Connected repositories</button>
+                <button type="button" className="selected" onClick={() => setGithubMode("public-url")}>Public URL</button>
+              </div>}
+              {!githubConnected && <p className="form-hint">Connect a fine-grained GitHub token in Settings to deploy private repositories.</p>}
+              <label>
+                Public repository URL
+                <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/owner/repository" required type="url" />
+              </label>
+              <label>
+                Branch <span className="optional-label">OPTIONAL · DEFAULT BRANCH IF EMPTY</span>
+                <input value={publicBranch} onChange={(e) => setPublicBranch(e.target.value)} placeholder="main" />
+              </label>
+            </>
+          )
         ) : (
           <label>
             Source archive
@@ -798,7 +881,7 @@ function DeployModal({
           <button type="button" className="button button-light" onClick={onClose}>
             Cancel
           </button>
-          <button className="button button-primary" disabled={busy}>
+          <button className="button button-primary" disabled={busy || (tab === "github" && githubMode === "repository" && branchesLoading)}>
             {busy ? (
               <>
                 <LoaderCircle size={15} className="spin" /> Building…
@@ -1521,12 +1604,47 @@ export function LogsPage({ notify }: { notify: Props["notify"] }) {
 }
 
 export function SettingsPage({ notify }: { notify: Props["notify"] }) {
-  const [data, setData] = useState<any>(null);
+  const [data, setData] = useState<any>(null),
+    [githubConnected, setGithubConnected] = useState(false),
+    [githubToken, setGithubToken] = useState(""),
+    [githubBusy, setGithubBusy] = useState(false);
+  async function refreshGitHub() {
+    const connection = await api<{ connected: boolean }>("/github/connection");
+    setGithubConnected(connection.connected);
+  }
   useEffect(() => {
     api("/settings")
       .then(setData)
       .catch((e) => notify(e.message, "error"));
+    refreshGitHub().catch((e) => notify(e.message, "error"));
   }, []);
+  async function connectGitHub(event: FormEvent) {
+    event.preventDefault();
+    setGithubBusy(true);
+    try {
+      await api("/github/connection", { method: "PUT", body: JSON.stringify({ token: githubToken }) });
+      setGithubToken("");
+      await refreshGitHub();
+      notify("GitHub connected");
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "Could not connect GitHub", "error");
+    } finally {
+      setGithubBusy(false);
+    }
+  }
+  async function disconnectGitHub() {
+    if (!window.confirm("Disconnect GitHub? Private repository redeploys will stop until you reconnect.")) return;
+    setGithubBusy(true);
+    try {
+      await api("/github/connection", { method: "DELETE" });
+      await refreshGitHub();
+      notify("GitHub disconnected");
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "Could not disconnect GitHub", "error");
+    } finally {
+      setGithubBusy(false);
+    }
+  }
   return (
     <div className="page-body">
       <Header
@@ -1558,6 +1676,32 @@ export function SettingsPage({ notify }: { notify: Props["notify"] }) {
               <code>{data?.storage_root || "/data/files"}</code>
             </strong>
           </div>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div>
+          <h2>GitHub</h2>
+          <p>Connect a fine-grained token to deploy private repositories.</p>
+        </div>
+        <div className="panel github-settings-panel">
+          <div className="github-settings-status">
+            <strong>{githubConnected ? "Connected" : "Not connected"}</strong>
+            {githubConnected && <span>Choose accessible repositories when deploying an application.</span>}
+          </div>
+          {githubConnected ? (
+            <button className="button button-light" onClick={disconnectGitHub} disabled={githubBusy}>Disconnect GitHub</button>
+          ) : (
+            <form className="github-connect-form" onSubmit={connectGitHub}>
+              <label>
+                Fine-grained personal access token
+                <input type="password" autoComplete="new-password" value={githubToken} onChange={(e) => setGithubToken(e.target.value)} placeholder="github_pat_…" required minLength={20} maxLength={512} />
+              </label>
+              <p>Grant read access to repository metadata and contents, and select only the repositories Arfeen Cloud should deploy.</p>
+              <button className="button button-primary" disabled={githubBusy || !githubToken}>
+                {githubBusy ? "Connecting…" : "Connect GitHub"}
+              </button>
+            </form>
+          )}
         </div>
       </section>
       <section className="settings-section">
