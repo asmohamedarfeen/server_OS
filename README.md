@@ -295,6 +295,16 @@ Then run `sudo docker compose up -d` and open `http://<ubuntu-lan-ip>:8080` from
 - GitHub builds start from the dashboard. Automatic deploys on every push, GitHub webhooks, automatic public-domain certificate issuance, scheduled backups, and plugin installation are not implemented.
 - The current guide provides private remote access through Tailscale. Making the dashboard publicly accessible to any browser through a custom domain requires a separate HTTPS and firewall configuration; do not expose the current HTTP port directly.
 
+## Live deployment output
+
+Clicking **Build and deploy** creates a background job and opens the deployment workspace immediately. The workspace shows source download/unpacking, framework detection, Docker build output, container startup, and verification. Logs update about every 1.5 seconds and include timestamps and failure details. **Follow logs**, **Copy logs**, and **Download logs** are available in the console.
+
+Use **Continue in background** to close the workspace without stopping the build. Reopen it from **Build activity** on Applications or Deployments; those lists refresh automatically. GitHub, ZIP, and redeploy flows all use the same worker. A single build runs at a time; additional deployments queue, and duplicate submissions for the same application point to its existing job.
+
+Logs and job results persist in the existing SQLite data volume. Tokens and environment values are redacted before log storage. Each job keeps up to 8 MiB of output; the console displays the latest 2,000 entries, while Download provides the full retained output. A backend restart marks unfinished jobs as **interrupted** rather than silently resuming a potentially partial deployment. Check the application state before retrying an interrupted job.
+
+For backend regression tests, install `backend/requirements-dev.txt` into a Python 3.11+ virtual environment and run `python -m unittest discover -s tests -v`. Optional frontend browser checks are in `tests/ui_deployment_console.py`; they use Playwright, installed Chrome, a local production frontend on port 3100, and controlled API fixtures.
+
 ## Deploying a private GitHub repository
 
 1. In GitHub, create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new). Limit repository access to the repositories Arfeen Cloud should deploy. Grant **Contents: Read-only**; GitHub also requires **Metadata: Read-only** to list repositories and branches. If GitHub asks for organization approval, complete that approval before connecting.

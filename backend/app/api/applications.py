@@ -2,6 +2,9 @@ import json
 import os
 import re
 import signal
+import selectors
+import time
+import codecs
 import shutil
 import subprocess
 import uuid
@@ -18,6 +21,7 @@ from ..core.config import WORKSPACE_DIR
 from ..core.db import connection
 from ..services.docker_engine import client
 from ..services.github import GitHubError, github_token
+from ..services import deployment_jobs as jobs
 
 router = APIRouter(prefix="/api/apps", tags=["applications"], dependencies=[Depends(get_current_user)])
 
@@ -32,6 +36,7 @@ def record_deployment_attempt(attempt_id: str, source: str, source_ref: str, sta
         )
 
 def mark_attempt(attempt: dict, status: str, stage: str, message: str, app_id: str | None = None, image: str | None = None):
+    jobs.stage(stage, message)
     attempt["stage"] = stage
     if app_id is not None:
         attempt["app_id"] = app_id
@@ -132,6 +137,8 @@ def generated_dockerfile(root: Path, kind: str, framework: str, port: int):
         root.joinpath("Dockerfile").write_text("FROM golang:1.24-alpine AS build\nWORKDIR /src\nCOPY . .\nRUN go build -o /app .\nFROM alpine:3.21\nCOPY --from=build /app /app\nEXPOSE 8080\nCMD [\"/app\"]\n")
 
 def safe_name(value):
+    if not isinstance(value, str):
+        raise HTTPException(400, "Choose a valid application name")
     slug = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")[:45]
     if not slug: raise HTTPException(400, "Choose a valid application name")
     return slug
@@ -158,6 +165,58 @@ def canonical_github_url(value):
         return None
     return f"https://github.com/{match.group(1)}/{match.group(2)}.git"
 
+def build_image(engine, root: Path, image_tag: str):
+    if not jobs.output():
+        image, _ = engine.images.build(path=str(root), tag=image_tag, rm=True, pull=True, timeout=1800)
+        return image
+    pending = ""
+    stream = engine.api.build(path=str(root), tag=image_tag, rm=True, pull=True, timeout=1800, decode=True)
+    try:
+        for event in stream:
+            if event.get("error") or event.get("errorDetail"):
+                error = event.get("error") or event["errorDetail"].get("message", "Docker build failed")
+                raise HTTPException(400, f"Image build failed: {error}")
+            if "stream" in event:
+                pending += event["stream"]
+                lines = re.split(r"[\r\n]", pending)
+                pending = lines.pop()
+                for line in lines:
+                    jobs.log(line)
+                # Bound pathological output without storing incomplete secret-bearing lines.
+                if len(pending) > 1024 * 1024:
+                    pending = "[Oversized build output line omitted]"
+            elif event.get("status"):
+                progress = event.get("progress", "")
+                jobs.log(f"{event.get('id', '')} {event['status']} {progress}".strip())
+        jobs.log(pending)
+    finally:
+        if hasattr(stream, "close"):
+            stream.close()
+    return engine.images.get(image_tag)
+
+
+def verify_container(container):
+    if not jobs.output():
+        return
+    jobs.stage("verify", "Checking container startup and health")
+    deadline = time.monotonic() + 90
+    time.sleep(2)
+    while True:
+        container.reload()
+        state = container.attrs.get("State", {})
+        health = state.get("Health", {}).get("Status")
+        if container.status != "running" or health == "unhealthy":
+            jobs.log(container.logs(tail=50).decode("utf-8", errors="replace"), "error")
+            raise HTTPException(400, f"Container startup failed: status={container.status}, health={health or 'not configured'}")
+        if health != "starting":
+            jobs.log("Container health check passed" if health == "healthy" else "Container is running (no Docker health check is configured)")
+            return
+        if time.monotonic() >= deadline:
+            jobs.log(container.logs(tail=50).decode("utf-8", errors="replace"), "error")
+            raise HTTPException(400, "Container health check did not become ready within 90 seconds")
+        time.sleep(2)
+
+
 def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json: str = "{}", source_type: str = "github", source_ref: str = "", attempt: dict | None = None):
     if domain and (len(domain) > 253 or not re.fullmatch(r"(?=.{1,253}$)([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", domain)):
         raise HTTPException(400, "Enter a valid hostname")
@@ -166,13 +225,19 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
         if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()): raise ValueError()
     except (TypeError, ValueError):
         raise HTTPException(400, "Environment variables must be a JSON object of string values")
+    jobs.add_secrets(env.values())
     if attempt:
         mark_attempt(attempt, "running", "detect", "Detecting application framework")
+    else:
+        jobs.stage("detect", "Detecting application framework")
     framework, port, kind = detect_framework(root)
+    jobs.log(f"Detected {framework}; container port {port}; build context {root}")
     generated_dockerfile(root, kind, framework, port)
     app_id = str(uuid.uuid4())
     if attempt:
         mark_attempt(attempt, "running", "build", "Building the application image", app_id)
+    else:
+        jobs.stage("build", "Building the application image")
     safe = safe_name(name)
     with connection() as db:
         if db.execute("SELECT 1 FROM applications WHERE name=?",(safe,)).fetchone():
@@ -182,7 +247,7 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     image_tag = f"arfeen/{safe}:{app_id[:8]}"
     docker = client()
     try:
-        image, _ = docker.images.build(path=str(root), tag=image_tag, rm=True, pull=True, timeout=1800)
+        image = build_image(docker, root, image_tag)
     except BuildError as exc:
         detail = "\n".join(x.get("stream", "") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400, f"Image build failed: {detail}")
@@ -205,9 +270,19 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
         kwargs["ports"] = None
     if attempt:
         mark_attempt(attempt, "running", "deploy", "Starting the application container", app_id, image_tag)
+    else:
+        jobs.stage("deploy", "Starting the application container")
     container = docker.containers.run(**kwargs)
-    # containers.run already joined arfeen_internal; only add the proxy network.
-    docker.networks.get("arfeen_proxy").connect(container)
+    try:
+        docker.networks.get("arfeen_proxy").connect(container)
+        jobs.log(f"Started container {container.short_id}; image {image_tag}")
+        verify_container(container)
+    except Exception:
+        try:
+            container.remove(force=True)
+        except Exception as cleanup_error:
+            jobs.log(f"Could not remove failed container {container.short_id}: {cleanup_error}", "error")
+        raise
     with connection() as db:
         db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json,source_type,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, "running", container.id, image_tag, domain, now(), env_json, source_type, source_ref))
         db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), app_id, "success", "Build and deployment completed", now(), image_tag))
@@ -299,8 +374,40 @@ def deploy_github(body: dict):
     finally: shutil.rmtree(source_dir, ignore_errors=True)
 
 
+def stream_clone(process):
+    deadline = time.monotonic() + 900
+    pending = ""
+    tail = ""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("git clone", 900)
+            if not selector.select(timeout=1):
+                continue
+            data = os.read(process.stdout.fileno(), 4096)
+            if not data:
+                pending += decoder.decode(b"", final=True)
+                jobs.log(pending)
+                tail = (tail + pending)[-2000:]
+                break
+            pending += decoder.decode(data)
+            lines = re.split(r"[\r\n]", pending)
+            pending = lines.pop()
+            for line in lines:
+                jobs.log(line)
+                tail = (tail + line + "\n")[-2000:]
+            if len(pending) > 1024 * 1024:
+                pending = "[Oversized Git output line omitted]"
+    process.wait(timeout=max(1, deadline - time.monotonic()))
+    return tail
+
+
 def clone_github_repository(url: str, ref: str, destination: Path, token: str | None = None):
-    command = ["git", "clone", "--depth", "1", "--single-branch"]
+    jobs.add_secrets([token])
+    jobs.stage("clone", f"Fetching {url} ({ref or 'default branch'})")
+    command = ["git", "clone", "--depth", "1", "--single-branch", "--progress"]
     if ref:
         command.append(f"--branch={ref}")
     command.extend(["--", url, str(destination)])
@@ -316,18 +423,24 @@ def clone_github_repository(url: str, ref: str, destination: Path, token: str | 
             environment["GIT_ASKPASS"] = str(helper)
             environment["GIT_TERMINAL_PROMPT"] = "0"
             environment["ARFEEN_GITHUB_TOKEN"] = token
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, env=environment, start_new_session=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT if jobs.output() else subprocess.PIPE,
+                                   text=not bool(jobs.output()), env=environment, start_new_session=True)
         try:
-            _, stderr = process.communicate(timeout=900)
-        except subprocess.TimeoutExpired as exc:
+            if jobs.output():
+                stderr = stream_clone(process)
+            else:
+                _, stderr = process.communicate(timeout=900)
+        except BaseException as exc:
             # Git launches transport/index-pack children; stop the entire clone.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.communicate()
-            raise GitHubError("GitHub clone timed out after 900 seconds.") from exc
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise GitHubError("GitHub clone timed out after 900 seconds.") from exc
+            raise
         if process.returncode:
             detail = stderr.replace(token, "[redacted]") if token else stderr
             raise GitHubError(f"GitHub clone failed: {detail[-1200:].strip() or 'check repository access and branch name'}")
@@ -337,6 +450,7 @@ def clone_github_repository(url: str, ref: str, destination: Path, token: str | 
 
 @router.post("/zip")
 async def deploy_zip(file: UploadFile = File(...), name: str = Form(...), domain: str = Form(""), environment: str = Form("{}")):
+    jobs.stage("clone", "Unpacking uploaded ZIP archive")
     if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(400, "Upload a .zip archive")
     source_dir = WORKSPACE_DIR / str(uuid.uuid4())
@@ -380,12 +494,16 @@ async def deploy_zip(file: UploadFile = File(...), name: str = Form(...), domain
 def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = None):
     with connection() as db: row=db.execute("SELECT * FROM applications WHERE id=?",(app_id,)).fetchone()
     if not row: raise HTTPException(404,"Application not found")
+    jobs.add_secrets(json.loads(row["env_json"] or "{}").values())
     if attempt: mark_attempt(attempt,"running","detect","Detecting application framework",app_id)
+    else: jobs.stage("detect", "Detecting application framework")
     framework,port,kind=detect_framework(root)
+    jobs.log(f"Detected {framework}; container port {port}; build context {root}")
     generated_dockerfile(root,kind,framework,port)
     build_id=str(uuid.uuid4()); image_tag=f"arfeen/{row['name']}:{build_id[:8]}"; docker=client()
     if attempt: mark_attempt(attempt,"running","build","Building the replacement image",app_id)
-    try: image,_=docker.images.build(path=str(root),tag=image_tag,rm=True,pull=True,timeout=1800)
+    else: jobs.stage("build", "Building the replacement image")
+    try: image=build_image(docker,root,image_tag)
     except BuildError as exc:
         detail="\n".join(x.get("stream","") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400,f"Image build failed: {detail}")
@@ -397,12 +515,14 @@ def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = N
     previous_image=row["image"]
     replacement=None
     if attempt: mark_attempt(attempt,"running","deploy","Starting the replacement container",app_id,image_tag)
+    else: jobs.stage("deploy", "Starting the replacement container")
     try:
         if old and old.status=="running": old.stop(timeout=10)
         replacement=docker.containers.create(image.id,name=f"arfeen-{row['name']}-{build_id[:8]}",environment=json.loads(row["env_json"] or "{}"),labels=labels,ports=({f"{port}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
         if row["domain"]:
             docker.networks.get("arfeen_proxy").connect(replacement)
         replacement.start()
+        verify_container(replacement)
     except Exception as exc:
         if replacement:
             try: replacement.remove(force=True)

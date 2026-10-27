@@ -2,6 +2,7 @@
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { api, bytes } from "@/lib/api";
 import { AppRecord, Container, DatabaseRecord } from "@/lib/types";
+import { DeploymentConsole, DeploymentJobsPanel, DeploymentJob } from "./deployment-console";
 import {
   Activity,
   ArrowDownToLine,
@@ -364,6 +365,8 @@ function CreateContainer({
 }
 
 export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
+  const [buildJob, setBuildJob] = useState<string | null>(null);
+  const [jobsRevision, setJobsRevision] = useState(0);
   const [items, setItems] = useState<AppRecord[]>([]),
     [loading, setLoading] = useState(true),
     [modal, setModal] = useState(false),
@@ -399,9 +402,9 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
   async function redeploy(app: AppRecord) {
     if (app.source_type === "github-private" || app.source_type === "github" || app.source.startsWith("https://github.com/") || app.source.startsWith("https://www.github.com/")) {
       try {
-        await api(`/apps/${app.id}/redeploy/github`, { method: "POST" });
-        notify(`${app.name} redeployed`);
-        load();
+        const job = await api<DeploymentJob>(`/deployment-jobs/apps/${app.id}/github`, { method: "POST" });
+        setBuildJob(job.id);
+        setJobsRevision((value) => value + 1);
       } catch (e) {
         notify(e instanceof Error ? e.message : "Redeploy failed", "error");
       }
@@ -416,9 +419,9 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
     const form = new FormData();
     form.set("file", file);
     try {
-      await api(`/apps/${zipApp.id}/redeploy/zip`, { method: "POST", body: form });
-      notify(`${zipApp.name} redeployed`);
-      load();
+      const job = await api<DeploymentJob>(`/deployment-jobs/apps/${zipApp.id}/zip`, { method: "POST", body: form });
+      setBuildJob(job.id);
+      setJobsRevision((value) => value + 1);
     } catch (e) {
       notify(e instanceof Error ? e.message : "Redeploy failed", "error");
     } finally {
@@ -457,6 +460,7 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
           <span>attention needed</span>
         </div>
       </div>
+      <DeploymentJobsPanel onOpen={setBuildJob} refreshKey={jobsRevision} onFinished={load} />
       {loading ? (
         <div className="panel loading-line">
           <LoaderCircle size={17} className="spin" /> Loading applications…
@@ -533,12 +537,14 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
         <DeployModal
           notify={notify}
           onClose={() => setModal(false)}
-          onCreated={() => {
+          onQueued={(id) => {
             setModal(false);
-            load();
+            setBuildJob(id);
+            setJobsRevision((value) => value + 1);
           }}
         />
       )}
+      {buildJob && <DeploymentConsole key={buildJob} jobId={buildJob} onClose={() => setBuildJob(null)} onFinished={load} />}
       {envApp && (
         <EnvironmentModal
           app={envApp}
@@ -579,6 +585,7 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
   );
 }
 export function DeploymentsPage({ notify }: { notify: Props["notify"] }) {
+  const [buildJob, setBuildJob] = useState<string | null>(null);
   const [items, setItems] = useState<any[]>([]),
     [busy, setBusy] = useState(true);
   const load = () => {
@@ -627,6 +634,8 @@ export function DeploymentsPage({ notify }: { notify: Props["notify"] }) {
           </button>
         }
       />
+      <DeploymentJobsPanel onOpen={setBuildJob} onFinished={load} />
+      {buildJob && <DeploymentConsole key={buildJob} jobId={buildJob} onClose={() => setBuildJob(null)} onFinished={load} />}
       <section className="panel data-panel">
         {busy ? (
           <div className="loading-line">
@@ -700,11 +709,11 @@ function environmentText(input: Record<string, string>) {
 function DeployModal({
   notify,
   onClose,
-  onCreated,
+  onQueued,
 }: {
   notify: Props["notify"];
   onClose: () => void;
-  onCreated: () => void;
+  onQueued: (id: string) => void;
 }) {
   const [tab, setTab] = useState("github"),
     [name, setName] = useState(""),
@@ -757,14 +766,15 @@ function DeployModal({
     setBusy(true);
     try {
       const environment = parseEnvironment(envText);
-      if (tab === "github" && githubMode === "repository") {
+      let job: DeploymentJob;
+      if (tab === "github" && githubConnected && githubMode === "repository") {
         if (!selectedRepository || !branch || branchesLoading) throw new Error("Choose a repository and branch");
-        await api("/apps/github", {
+        job = await api<DeploymentJob>("/deployment-jobs/github", {
           method: "POST",
           body: JSON.stringify({ name, owner: selectedRepository.owner, repo: selectedRepository.name, ref: branch, domain: domain || null, environment }),
         });
       } else if (tab === "github") {
-        await api("/apps/github", {
+        job = await api<DeploymentJob>("/deployment-jobs/github", {
           method: "POST",
           body: JSON.stringify({ name, url, ref: publicBranch, domain: domain || null, environment }),
         });
@@ -775,12 +785,12 @@ function DeployModal({
         data.set("name", name);
         data.set("domain", domain);
         data.set("environment", JSON.stringify(environment));
-        await api("/apps/zip", { method: "POST", body: data });
+        job = await api<DeploymentJob>("/deployment-jobs/zip", { method: "POST", body: data });
       }
-      notify("Application deployed successfully");
-      onCreated();
+      onQueued(job.id);
     } catch (err) {
-      notify(err instanceof Error ? err.message : "Deployment failed", "error");
+      if (err instanceof Error && "jobId" in err && typeof err.jobId === "string") onQueued(err.jobId);
+      else notify(err instanceof Error ? err.message : "Deployment failed", "error");
     } finally {
       setBusy(false);
     }
@@ -884,7 +894,7 @@ function DeployModal({
           <button className="button button-primary" disabled={busy || (tab === "github" && githubMode === "repository" && branchesLoading)}>
             {busy ? (
               <>
-                <LoaderCircle size={15} className="spin" /> Building…
+                <LoaderCircle size={15} className="spin" /> Creating deployment…
               </>
             ) : (
               "Build and deploy"

@@ -10,6 +10,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, app_id TEXT NOT NULL, status TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, image TEXT);
         CREATE TABLE IF NOT EXISTS deployment_attempts (id TEXT PRIMARY KEY, app_id TEXT, source TEXT NOT NULL, source_ref TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, stage TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, image TEXT);
         CREATE TABLE IF NOT EXISTS databases (id TEXT PRIMARY KEY, name TEXT NOT NULL, engine TEXT NOT NULL, container_id TEXT, username TEXT, password TEXT, port INTEGER, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS deployment_jobs (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, resource_key TEXT NOT NULL,
+          source TEXT NOT NULL, ref TEXT NOT NULL, status TEXT NOT NULL,
+          stage TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL,
+          started_at TEXT, finished_at TEXT, app_id TEXT, result_json TEXT,
+          log_bytes INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS deployment_job_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+          created_at TEXT NOT NULL, stage TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS job_logs_cursor ON deployment_job_logs(job_id,id);
+        CREATE UNIQUE INDEX IF NOT EXISTS active_deployment_resource ON deployment_jobs(resource_key)
+          WHERE status IN ('queued','running');
         """)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(applications)").fetchall()}
         if "host_port" not in columns:

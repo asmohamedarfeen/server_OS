@@ -10,7 +10,10 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed (${response.status})`);
+    const detail = body?.detail;
+    const error = new Error(typeof detail === "string" ? detail : detail?.message || `Request failed (${response.status})`);
+    if (detail?.job_id) Object.assign(error, { jobId: detail.job_id });
+    throw error;
   }
   if (response.status === 204) return undefined as T;
   return response.json();
