@@ -206,6 +206,35 @@ This works from anywhere your device can connect to Tailscale. A device without 
 
 ## Updating Arfeen Cloud
 
+### Automatic production deployments
+
+Production follows the GitHub repository's `main` branch. Every push to `main` queues the **Deploy production** workflow in `.github/workflows/deploy-production.yml`. A repository-scoped self-hosted runner on the Ubuntu server checks out the exact triggering commit and runs `scripts/deploy-production.sh`. Pushes to other branches do not deploy production.
+
+You can also redeploy `main` without creating a commit:
+
+1. Open the repository on GitHub.
+2. Select **Actions**, then **Deploy production**.
+3. Select **Run workflow**, leave the branch set to `main`, and confirm.
+
+The production runner is a security boundary. A workflow revision merged into `main` can execute commands on the server with the `md` account's Docker and passwordless-sudo access. Protect GitHub accounts with two-factor authentication, review workflow changes before they reach `main`, and never route pull-request or fork workflows to the `arfeen-production` runner.
+
+The deployment script serializes updates, snapshots the previous application source, synchronizes the new commit, rebuilds the Compose stack, and checks the local dashboard. It excludes `.env`, `storage/`, Git data, local dependency/build directories, and Docker named volumes. It never runs `docker compose down` or a Docker prune command. If source synchronization, build, startup, or health verification fails after the snapshot, the script restores the previous source and attempts to restart its Compose stack before the workflow reports failure.
+
+Check runner and application status on Ubuntu with:
+
+```bash
+systemctl status 'actions.runner.*'
+sudo journalctl -u '<exact-service-name>' --since '30 minutes ago'
+cd /home/md/arfeen-cloud
+sudo docker compose ps
+sudo docker compose logs --tail=100 traefik backend frontend
+curl --fail --silent --show-error http://127.0.0.1:8080/ >/dev/null
+```
+
+Replace `<exact-service-name>` with the unit name shown by the `systemctl status` command. When a deployment fails, inspect its GitHub Actions log first, then check the runner service, Compose status, and recent service logs. Confirm the current dashboard still responds before rerunning the workflow. Do not replace the server's `.env` or `storage/` directory while recovering; automatic source rollback deliberately leaves both untouched.
+
+### Manual archive update
+
 From the Mac, create and copy a new archive using the commands in step 4. The archive excludes `.env` and `storage/`, so it will not replace the server secrets or managed files. On Ubuntu:
 
 ```bash
