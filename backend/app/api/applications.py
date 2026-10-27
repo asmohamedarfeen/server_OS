@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import uuid
@@ -181,7 +182,7 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     image_tag = f"arfeen/{safe}:{app_id[:8]}"
     docker = client()
     try:
-        image, _ = docker.images.build(path=str(root), tag=image_tag, rm=True, pull=True)
+        image, _ = docker.images.build(path=str(root), tag=image_tag, rm=True, pull=True, timeout=1800)
     except BuildError as exc:
         detail = "\n".join(x.get("stream", "") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400, f"Image build failed: {detail}")
@@ -198,7 +199,6 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
         if host_port is None:
             raise HTTPException(503, "No free application ports are available")
     labels = {"com.arfeen.managed": "true", "com.arfeen.app-id": app_id}
-    networks = ["arfeen_internal", "arfeen_proxy"]
     kwargs = {"image": image.id, "name": f"arfeen-{safe}-{app_id[:8]}", "detach": True, "environment": env, "labels": labels, "ports": {f"{port}/tcp": host_port} if host_port else None, "network": "arfeen_internal"}
     if domain:
         kwargs["labels"].update({"traefik.enable": "true", "traefik.http.routers." + safe + ".rule": f"Host(`{domain}`)", "traefik.http.routers." + safe + ".entrypoints": "web", "traefik.http.services." + safe + ".loadbalancer.server.port": str(port)})
@@ -206,9 +206,8 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     if attempt:
         mark_attempt(attempt, "running", "deploy", "Starting the application container", app_id, image_tag)
     container = docker.containers.run(**kwargs)
-    for network_name in networks:
-        try: docker.networks.get(network_name).connect(container)
-        except docker.errors.NotFound: pass
+    # containers.run already joined arfeen_internal; only add the proxy network.
+    docker.networks.get("arfeen_proxy").connect(container)
     with connection() as db:
         db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json,source_type,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, "running", container.id, image_tag, domain, now(), env_json, source_type, source_ref))
         db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), app_id, "success", "Build and deployment completed", now(), image_tag))
@@ -317,12 +316,21 @@ def clone_github_repository(url: str, ref: str, destination: Path, token: str | 
             environment["GIT_ASKPASS"] = str(helper)
             environment["GIT_TERMINAL_PROMPT"] = "0"
             environment["ARFEEN_GITHUB_TOKEN"] = token
-        result = subprocess.run(command, capture_output=True, text=True, timeout=180, env=environment)
-        if result.returncode:
-            detail = result.stderr.replace(token, "[redacted]") if token else result.stderr
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env=environment, start_new_session=True)
+        try:
+            _, stderr = process.communicate(timeout=900)
+        except subprocess.TimeoutExpired as exc:
+            # Git launches transport/index-pack children; stop the entire clone.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise GitHubError("GitHub clone timed out after 900 seconds.") from exc
+        if process.returncode:
+            detail = stderr.replace(token, "[redacted]") if token else stderr
             raise GitHubError(f"GitHub clone failed: {detail[-1200:].strip() or 'check repository access and branch name'}")
-    except subprocess.TimeoutExpired as exc:
-        raise GitHubError("GitHub clone timed out after 180 seconds.") from exc
     finally:
         if helper_dir:
             helper_dir.cleanup()
@@ -377,7 +385,7 @@ def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = N
     generated_dockerfile(root,kind,framework,port)
     build_id=str(uuid.uuid4()); image_tag=f"arfeen/{row['name']}:{build_id[:8]}"; docker=client()
     if attempt: mark_attempt(attempt,"running","build","Building the replacement image",app_id)
-    try: image,_=docker.images.build(path=str(root),tag=image_tag,rm=True,pull=True)
+    try: image,_=docker.images.build(path=str(root),tag=image_tag,rm=True,pull=True,timeout=1800)
     except BuildError as exc:
         detail="\n".join(x.get("stream","") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400,f"Image build failed: {detail}")

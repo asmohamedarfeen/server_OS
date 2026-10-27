@@ -2,6 +2,9 @@ import os
 import sys
 import tempfile
 import unittest
+import subprocess
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -87,6 +90,46 @@ class ApplicationDetectionTests(unittest.TestCase):
             applications.detect_framework(self.root),
             ("FastAPI", 8000, "python"),
         )
+
+    def test_clone_allows_downloads_longer_than_three_minutes(self):
+        class Download:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                if timeout < 900:
+                    raise subprocess.TimeoutExpired("git", timeout)
+                return "", ""
+
+        with patch.object(applications.subprocess, "Popen", return_value=Download()):
+            applications.clone_github_repository(
+                "https://github.com/example/large.git", "main", self.root
+            )
+
+    def test_deployment_connects_container_to_proxy_without_rejoining_internal(self):
+        from app.core.db import init_db
+        init_db()
+        (self.root / "requirements.txt").write_text("fastapi\n")
+
+        class Networks:
+            def get(self, name):
+                def connect(container):
+                    if name == "arfeen_internal":
+                        raise RuntimeError("endpoint already exists on network")
+                return SimpleNamespace(connect=connect)
+
+        engine = SimpleNamespace(
+            images=SimpleNamespace(build=lambda **kwargs: (SimpleNamespace(id="image"), [])),
+            containers=SimpleNamespace(
+                list=lambda **kwargs: [],
+                run=lambda **kwargs: SimpleNamespace(id="container", short_id="container"),
+            ),
+            networks=Networks(),
+        )
+        with patch.object(applications, "client", return_value=engine):
+            result = applications.deploy_tree(
+                "test-" + self.root.name.lower(), "ZIP upload", self.root, None
+            )
+        self.assertEqual(result["status"], "running")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ RUN addgroup --system --gid 1001 nextjs && adduser --system --uid 1001 nextjs
 COPY --from=build --chown=nextjs:nextjs /app/.next ./.next
 COPY --from=build /app/public ./public
 COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=dependencies /app/node_modules ./node_modules
 USER nextjs
 EXPOSE 3000
