@@ -15,7 +15,7 @@ def run():
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
-        status = {"value": "running", "polls": 0}
+        status = {"value": "running", "polls": 0, "extra": False}
         created = "2026-10-27T16:00:00Z"
         job = {"id": "test-job", "name": "cardiovision", "source": "https://github.com/example/cardiovision.git", "ref": "main", "status": "running", "stage": "build", "message": "Installing dependencies", "created_at": created, "started_at": created}
         app = {"id": "app-id", "name": "cardiovision", "status": "running", "framework": "Dockerfile", "source": job["source"], "source_type": "github", "port": 8000, "host_port": 45001, "created_at": created}
@@ -41,10 +41,13 @@ def run():
                     {"id": 1, "created_at": created, "stage": "clone", "level": "info", "message": "Receiving objects: 100% (412/412)"},
                     {"id": 2, "created_at": created, "stage": "build", "level": "info", "message": "Step 3/12 : RUN npm ci\nadded 182 packages"},
                 ]
+                lines.extend({"id": i, "created_at": created, "stage": "build", "level": "info", "message": f"Build output line {i}"} for i in range(10, 310))
                 if status["polls"] >= 2:
-                    lines.append({"id": 3, "created_at": created, "stage": "build", "level": "info", "message": "Step 4/12 : RUN npm run build"})
+                    lines.append({"id": 310, "created_at": created, "stage": "build", "level": "info", "message": "Step 4/12 : RUN npm run build"})
+                if status["extra"]:
+                    lines.append({"id": 311, "created_at": created, "stage": "build", "level": "info", "message": "New live output while reading history"})
                 if status["value"] == "failed":
-                    lines.append({"id": 4, "created_at": created, "stage": "build", "level": "error", "message": "Build failed: missing application entrypoint"})
+                    lines.append({"id": 312, "created_at": created, "stage": "build", "level": "error", "message": "Build failed: missing application entrypoint"})
                 lines = [line for line in lines if line["id"] > cursor]
                 data = {**job, "status": status["value"], "message": "Build failed: missing application entrypoint" if status["value"] == "failed" else "Installing dependencies", "logs": lines, "has_more": False, "next_cursor": lines[-1]["id"] if lines else cursor}
             route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
@@ -56,6 +59,20 @@ def run():
         expect(page.get_by_role("dialog", name="cardiovision")).to_be_visible()
         expect(page.get_by_text("Receiving objects: 100%", exact=False)).to_be_visible()
         expect(page.get_by_text("Step 4/12", exact=False)).to_be_visible(timeout=8000)
+        log = page.get_by_role("log", name="Deployment build output")
+        assert log.evaluate("el => el.scrollHeight > el.clientHeight + 100"), "Long logs must overflow their own scroll panel"
+        assert log.evaluate("el => el.getBoundingClientRect().bottom <= document.querySelector('.deployment-console-footer').getBoundingClientRect().top"), "Log panel must fit above footer"
+        log.hover()
+        page.mouse.wheel(0, -600)
+        expect(page.get_by_role("checkbox", name="Follow logs")).not_to_be_checked()
+        before = log.evaluate("el => el.scrollTop")
+        status["extra"] = True
+        expect(page.get_by_text("New live output while reading history", exact=True)).to_be_attached(timeout=8000)
+        assert abs(log.evaluate("el => el.scrollTop") - before) < 5, "New logs must not interrupt reading history"
+        page.get_by_role("button", name="Latest logs").click()
+        expect(page.get_by_role("checkbox", name="Follow logs")).to_be_checked()
+        assert log.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight < 30")
+        print("PASS: bounded log scrolling, pause on scroll up, preserve position, jump to latest")
         page.screenshot(path="/tmp/deployment-console-desktop.png", full_page=True)
         page.get_by_role("button", name="Continue in background").click()
         status["value"] = "success"
@@ -70,6 +87,8 @@ def run():
         page.screenshot(path="/tmp/deployment-console-mobile.png", full_page=True)
         expect(page.get_by_role("button", name="Done", exact=True)).to_be_visible()
         assert page.locator(".deployment-console").evaluate("el => el.scrollWidth <= el.clientWidth")
+        assert log.evaluate("el => el.scrollHeight > el.clientHeight")
+        assert log.evaluate("el => el.getBoundingClientRect().bottom <= document.querySelector('.deployment-console-footer').getBoundingClientRect().top")
         page.keyboard.press("Escape")
         expect(page.get_by_role("dialog", name="cardiovision")).not_to_be_visible()
         assert not errors, errors

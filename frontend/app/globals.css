@@ -41,7 +41,7 @@
 .deployment-status.success { background: var(--green-soft); color: var(--green); }
 .deployment-status.failed, .deployment-status.interrupted { background: #fff0ef; color: #a73b38; }
 .deployment-backdrop { position: fixed; z-index: 150; inset: 0; padding: 32px; background: #101b297a; backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; }
-.deployment-console { width: min(1180px, 100%); max-height: calc(100dvh - 64px); display: flex; flex-direction: column; background: var(--surface); border-radius: 10px; overflow: hidden; box-shadow: 0 16px 64px #07121f40; outline: none; }
+.deployment-console { width: min(1180px, 100%); height: min(800px, calc(100dvh - 64px)); display: flex; flex-direction: column; background: var(--surface); border-radius: 10px; overflow: hidden; box-shadow: 0 16px 64px #07121f40; outline: none; }
 .deployment-console-heading { padding: 20px 24px; display: flex; gap: 14px; align-items: center; }
 .deployment-console-icon { width: 42px; height: 42px; border-radius: var(--radius); display: grid; place-items: center; color: var(--blue); background: #edf3ff; flex-shrink: 0; }
 .deployment-console-title { flex: 1; min-width: 0; }
@@ -51,7 +51,7 @@
 .deployment-source > span:first-of-type { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .deployment-source b { color: var(--ink); background: var(--surface); border: 1px solid var(--line); padding: 3px 7px; border-radius: 4px; font: 11px var(--mono); flex-shrink: 0; }
 .deployment-elapsed { display: flex; gap: 6px; align-items: center; margin-left: auto; white-space: nowrap; font-family: var(--mono); }
-.deployment-workspace { display: grid; grid-template-columns: 222px minmax(0, 1fr); min-height: 0; overflow: hidden; }
+.deployment-workspace { display: grid; grid-template-columns: 222px minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
 .deployment-stages { padding: 24px 20px; border-right: 1px solid var(--line); overflow-y: auto; }
 .deployment-stage { position: relative; display: flex; gap: 12px; padding-bottom: 28px; color: var(--muted); }
 .deployment-stage:not(:nth-last-of-type(1))::after { content: ""; position: absolute; top: 28px; bottom: 5px; left: 11px; width: 1px; background: var(--line); }
@@ -64,14 +64,21 @@
 .deployment-stage.failed { color: #a73b38; }
 .deployment-stage.failed .deployment-stage-marker { border-color: #f0c9c6; background: #fff0ef; }
 .deployment-stage-note { margin: 0; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.7; }
-.deployment-output { min-width: 0; display: flex; flex-direction: column; background: var(--build-console); }
+.deployment-output { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: var(--build-console); }
 .deployment-output-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid #293547; color: #a4b5cb; font: 10px var(--mono); letter-spacing: .6px; }
 .deployment-output-toolbar > span { display: flex; align-items: center; gap: 8px; }
 .deployment-output-toolbar i { width: 6px; height: 6px; border-radius: 50%; background: #798b9f; }
 .deployment-output-toolbar i.live { background: #7bd3a3; box-shadow: 0 0 0 3px #7bd3a312; }
 .deployment-output-toolbar label { display: flex; align-items: center; gap: 6px; letter-spacing: 0; cursor: pointer; }
 .deployment-output-toolbar input { accent-color: var(--blue); }
-.deployment-log { flex: 1; height: min(50dvh, 520px); min-height: 200px; overflow: auto; padding: 16px 20px; color: var(--build-console-text); scrollbar-color: #405169 var(--build-console); }
+.deployment-log { flex: 1 1 0; min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 20px; color: var(--build-console-text); scrollbar-color: #60758f var(--build-console); scrollbar-width: auto; }
+.deployment-console-heading, .deployment-source, .deployment-console-footer, .deployment-output-toolbar, .deployment-result, .deployment-connection-warning { flex-shrink: 0; }
+.deployment-result { max-height: 100px; overflow: auto; }
+.deployment-log::-webkit-scrollbar { width: 10px; height: 10px; }
+.deployment-log::-webkit-scrollbar-track { background: var(--build-console); }
+.deployment-log::-webkit-scrollbar-thumb { background: #60758f; border: 2px solid var(--build-console); border-radius: 5px; }
+.deployment-log-actions { display: flex; gap: 14px; align-items: center; }
+.deployment-latest { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #405169; border-radius: 4px; background: #203047; color: #d7e2ef; padding: 5px 7px; font: 10px var(--sans); }
 .deployment-log-empty { font: 12px/1.8 var(--mono); color: #a4b5cb; }
 .deployment-log-line { display: flex; align-items: baseline; gap: 16px; font: 11px/1.8 var(--mono); }
 .deployment-log-line time { color: #8296af; flex-shrink: 0; font-size: 10px; user-select: none; }
@@ -93,20 +100,20 @@
 }
 @media (max-width: 700px) {
   .deployment-backdrop { padding: 8px; }
-  .deployment-console { max-height: calc(100dvh - 16px); }
+  .deployment-console { height: min(800px, calc(100dvh - 16px)); }
   .deployment-console-heading { padding: 16px; gap: 8px; }
   .deployment-console-icon { display: none; }
   .deployment-console-title h2 { font-size: 17px; }
   .deployment-console-title p { font-size: 8px; }
   .deployment-source { padding: 10px 16px; font-size: 10px; gap: 6px; }
-  .deployment-workspace { display: flex; flex-direction: column; overflow-y: auto; }
+  .deployment-workspace { display: flex; flex-direction: column; overflow: hidden; }
   .deployment-stages { display: flex; gap: 12px; overflow-x: auto; padding: 14px 16px; border-right: 0; flex-shrink: 0; }
   .deployment-stage { padding: 0; gap: 6px; align-items: center; flex-shrink: 0; }
   .deployment-stage strong { font-size: 10px; margin: 0; }
   .deployment-stage small, .deployment-stage::after, .deployment-stage-note { display: none; }
   .deployment-stage-marker { width: 20px; height: 20px; }
-  .deployment-output { flex: 1; min-height: 240px; }
-  .deployment-log { height: 38dvh; padding: 12px; min-height: 150px; }
+  .deployment-output { flex: 1; min-height: 0; }
+  .deployment-log { padding: 12px; min-height: 0; }
   .deployment-log-line { gap: 8px; font-size: 10px; }
   .deployment-log-line time { font-size: 9px; }
   .deployment-output-toolbar { padding: 12px; }

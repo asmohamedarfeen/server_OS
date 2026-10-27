@@ -37,6 +37,7 @@ export function DeploymentConsole({ jobId, onClose, onFinished }: {
   const [copied, setCopied] = useState(false);
   const [time, setTime] = useState(Date.now());
   const scroll = useRef<HTMLDivElement>(null);
+  const lastScrollTop = useRef(0);
   const dialog = useRef<HTMLElement>(null);
   const finished = useRef(onFinished);
   finished.current = onFinished;
@@ -69,8 +70,19 @@ export function DeploymentConsole({ jobId, onClose, onFinished }: {
   }, [jobId]);
 
   useEffect(() => {
-    if (follow && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+    if (follow && scroll.current) {
+      scroll.current.scrollTop = scroll.current.scrollHeight;
+      lastScrollTop.current = scroll.current.scrollTop;
+    }
   }, [lines, follow]);
+
+  function latestLogs() {
+    setFollow(true);
+    if (scroll.current) {
+      scroll.current.scrollTop = scroll.current.scrollHeight;
+      lastScrollTop.current = scroll.current.scrollTop;
+    }
+  }
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -124,9 +136,18 @@ export function DeploymentConsole({ jobId, onClose, onFinished }: {
           <p className="deployment-stage-note">You can close this view. The build continues on your server.</p>
         </aside>
         <main className="deployment-output">
-          <div className="deployment-output-toolbar"><span><i className={job && active(job) ? "live" : ""} />BUILD OUTPUT</span><label><input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow logs</label></div>
+          <div className="deployment-output-toolbar"><span><i className={job && active(job) ? "live" : ""} />BUILD OUTPUT</span><div className="deployment-log-actions"><button className="deployment-latest" onClick={latestLogs}><ArrowDownToLine size={12} />Latest logs</button><label><input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow logs</label></div></div>
           {error && <div className="deployment-connection-warning" role="alert">{error}. Reconnecting automatically; the server job continues.</div>}
-          <div className="deployment-log" ref={scroll} role="log" aria-label="Deployment build output" aria-live="off" tabIndex={0}>
+          <div className="deployment-log" ref={scroll} role="log" aria-label="Deployment build output" aria-live="off" tabIndex={0}
+            onWheel={(event) => { if (event.deltaY < 0) setFollow(false); }}
+            onKeyDown={(event) => { if (["ArrowUp", "PageUp", "Home"].includes(event.key)) setFollow(false); }}
+            onScroll={(event) => {
+              const panel = event.currentTarget;
+              const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 24;
+              if (atBottom) setFollow(true);
+              else if (panel.scrollTop < lastScrollTop.current) setFollow(false);
+              lastScrollTop.current = panel.scrollTop;
+            }}>
             {!lines.length && <p className="deployment-log-empty">{job?.status === "queued" ? "Waiting for the current build to finish. Your deployment is safely queued." : "Connecting to the build worker…"}</p>}
             {lines.map((line) => <div className={`deployment-log-line ${line.level}`} key={line.id}><time dateTime={line.created_at}>{new Date(line.created_at).toLocaleTimeString("en-GB", { hour12: false })}</time><pre>{line.message}</pre></div>)}
           </div>
