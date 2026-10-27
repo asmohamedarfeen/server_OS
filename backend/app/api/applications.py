@@ -49,7 +49,39 @@ def safe_deployment_error(exc: Exception, token: str | None = None, environment:
             message = message.replace(secret, "[redacted]")
     return message[:2000]
 
+def dockerfile_tcp_port(path: Path) -> int:
+    lines = path.read_text(errors="ignore").splitlines()
+    final_stage_start = None
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*FROM(?:\s+|$)", line, re.IGNORECASE):
+            final_stage_start = index + 1
+
+    ports = set()
+    for line in lines[final_stage_start:] if final_stage_start is not None else []:
+        instruction = line.split("#", 1)[0].strip()
+        match = re.match(r"^EXPOSE\s+(.+)$", instruction, re.IGNORECASE)
+        if not match:
+            continue
+        for value in match.group(1).split():
+            port_value, separator, protocol = value.rpartition("/")
+            if separator:
+                if protocol.lower() != "tcp":
+                    continue
+                value = port_value
+            if value.isdigit() and 1 <= int(value) <= 65535:
+                ports.add(int(value))
+
+    if not ports:
+        raise HTTPException(422, "Dockerfile applications must declare one literal TCP port with EXPOSE <port> in the final build stage.")
+    if len(ports) > 1:
+        raise HTTPException(422, "Dockerfile applications must declare only one TCP port with EXPOSE <port> in the final build stage.")
+    return ports.pop()
+
+
 def detect_framework(root: Path):
+    dockerfile = root / "Dockerfile"
+    if dockerfile.exists():
+        return "Dockerfile", dockerfile_tcp_port(dockerfile), "dockerfile"
     names = {p.name for p in root.iterdir()}
     if "manage.py" in names: return "Django", 8000, "python"
     if "requirements.txt" in names or "pyproject.toml" in names:
