@@ -1288,10 +1288,30 @@ tbody tr:last-child td {
 }
 .app-card-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: center;
   justify-content: space-between;
   padding-top: 8px;
   border-top: 1px solid #edf0f4;
+}
+.application-endpoint { margin: 12px 0 8px; }
+.application-endpoint-label { font-size: 10px; color: #526477; }
+.application-endpoint .app-card-url { margin: 5px 0 0; min-width: 0; gap: 6px; }
+.app-card-url > a:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #345fa8; }
+.app-card-url .icon-button { flex-shrink: 0; width: 24px; height: 24px; }
+.runtime-console { padding: 0; border: 0; max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); color: var(--ink); }
+.runtime-console::backdrop { background: #101b297a; }
+.runtime-details { padding: 12px 24px; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; border-block: 1px solid var(--line); font-size: 12px; }
+.runtime-details a { display: inline-flex; gap: 6px; align-items: center; color: var(--blue-dark); }
+.runtime-output { flex: 1; }
+.runtime-log-text { margin: 0; font: 12px/1.8 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-console .deployment-console-footer > span { line-height: 1.7; }
+@media (max-width: 700px) {
+  .runtime-console { width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+  .runtime-details { padding: 12px; }
+  .runtime-console .deployment-output-toolbar { flex-wrap: wrap; }
+  .runtime-console .deployment-log-actions { flex-wrap: wrap; gap: 10px; }
 }
 .app-card-actions button {
   display: flex;

@@ -3,6 +3,7 @@ import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { api, bytes } from "@/lib/api";
 import { AppRecord, Container, DatabaseRecord } from "@/lib/types";
 import { DeploymentConsole, DeploymentJobsPanel, DeploymentJob } from "./deployment-console";
+import { ApplicationEndpoint, ApplicationRuntime } from "./application-runtime";
 import {
   Activity,
   ArrowDownToLine,
@@ -365,6 +366,7 @@ function CreateContainer({
 }
 
 export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
+  const [runtimeApp, setRuntimeApp] = useState<AppRecord | null>(null);
   const [buildJob, setBuildJob] = useState<string | null>(null);
   const [jobsRevision, setJobsRevision] = useState(0);
   const [items, setItems] = useState<AppRecord[]>([]),
@@ -502,13 +504,9 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
                 <p>
                   {app.framework} · {app.source_type === "github-private" ? `${app.source} · ${app.source_ref || "default branch"}` : app.source}
                 </p>
-                <div className="app-card-url">
-                  <span>
-                    {app.domain ? `http://${app.domain}` : `Container port :${app.host_port || "—"}`}
-                  </span>
-                  <span className="mono-cell">{app.domain ? `:${app.port}` : ""}</span>
-                </div>
+                <ApplicationEndpoint app={app} notify={notify} />
                 <div className="app-card-actions">
+                  <button onClick={() => setRuntimeApp(app)}><TerminalSquare size={14} /> Live logs</button>
                   <button onClick={() => redeploy(app)}>
                     <Upload size={14} /> Redeploy
                   </button>
@@ -545,6 +543,7 @@ export function ApplicationsPage({ notify }: { notify: Props["notify"] }) {
         />
       )}
       {buildJob && <DeploymentConsole key={buildJob} jobId={buildJob} onClose={() => setBuildJob(null)} onFinished={load} />}
+      {runtimeApp && <ApplicationRuntime key={runtimeApp.id} app={runtimeApp} onClose={() => setRuntimeApp(null)} />}
       {envApp && (
         <EnvironmentModal
           app={envApp}
@@ -706,7 +705,7 @@ function environmentText(input: Record<string, string>) {
     .map(([key, value]) => `${key}=${value}`)
     .join("\n");
 }
-function DeployModal({
+export function DeployModal({
   notify,
   onClose,
   onQueued,

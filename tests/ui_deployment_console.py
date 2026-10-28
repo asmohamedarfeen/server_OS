@@ -54,7 +54,7 @@ def run():
 
         page.route("**/api/**", api)
         page.goto("http://127.0.0.1:3100")
-        page.get_by_role("button", name="Applications", exact=True).click()
+        page.get_by_role("link", name="App Services", exact=True).first.click()
         page.get_by_role("button", name="View logs →").click()
         expect(page.get_by_role("dialog", name="cardiovision")).to_be_visible()
         expect(page.get_by_text("Receiving objects: 100%", exact=False)).to_be_visible()
@@ -76,7 +76,7 @@ def run():
         page.screenshot(path="/tmp/deployment-console-desktop.png", full_page=True)
         page.get_by_role("button", name="Continue in background").click()
         status["value"] = "success"
-        expect(page.locator(".app-card").filter(has_text="cardiovision")).to_be_visible(timeout=10000)
+        expect(page.get_by_role("link", name="cardiovision", exact=True).first).to_be_visible(timeout=10000)
         print("PASS: live incremental logs, close/background completion refresh")
 
         status["value"] = "failed"

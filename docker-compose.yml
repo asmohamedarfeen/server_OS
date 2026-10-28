@@ -8,6 +8,8 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --providers.docker.network=arfeen_proxy
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
       - --entrypoints.web.address=:80
       - --api.dashboard=false
       - --log.level=INFO
@@ -15,6 +17,7 @@ services:
       - "${CLOUD_BIND:-0.0.0.0}:${CLOUD_PORT:-8080}:80"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - arfeen_routes:/etc/traefik/dynamic:ro
     networks:
       - proxy
     labels:
@@ -36,6 +39,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - arfeen_data:/data
+      - arfeen_routes:/data/proxy-routes
       - ./storage:/data/files
       - deploy_workspace:/workspace
       - /:/host:rw
@@ -88,6 +92,9 @@ networks:
       com.arfeen.system: "true"
 
 volumes:
+  arfeen_routes:
+    labels:
+      com.arfeen.system: "true"
   arfeen_data:
     labels:
       com.arfeen.system: "true"

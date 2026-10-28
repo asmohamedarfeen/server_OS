@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from ..core.auth import get_current_user
 from ..services.docker_engine import client
+from .containers import _activity
 
 router=APIRouter(prefix="/api/docker",tags=["docker resources"],dependencies=[Depends(get_current_user)])
 
@@ -11,8 +12,15 @@ def images():
     except Exception as exc: raise HTTPException(503,str(exc))
 
 @router.delete("/images/{image_id}")
-def delete_image(image_id: str):
-    try: client().images.remove(image_id,force=False); return {"ok":True}
+def delete_image(image_id: str, actor: str = Depends(get_current_user)):
+    try:
+        docker=client()
+        if any((container.labels or {}).get('com.arfeen.system')=='true' for container in docker.containers.list(all=True,filters={'ancestor':image_id})):
+            raise HTTPException(409,'Platform images cannot be removed here')
+        docker.images.remove(image_id,force=False)
+        _activity('image.delete',image_id,image_id,'succeeded',actor)
+        return {'ok':True}
+    except HTTPException: raise
     except Exception as exc: raise HTTPException(400,str(exc))
 
 @router.get("/volumes")
@@ -21,11 +29,13 @@ def volumes():
     except Exception as exc: raise HTTPException(503,str(exc))
 
 @router.delete("/volumes/{name}")
-def delete_volume(name: str):
+def delete_volume(name: str, actor: str = Depends(get_current_user)):
     try:
         volume=client().volumes.get(name)
         if (volume.attrs.get("Labels") or {}).get("com.arfeen.system")=="true": raise HTTPException(409,"Platform data volumes cannot be removed here")
-        volume.remove(force=False); return {"ok":True}
+        volume.remove(force=False)
+        _activity('volume.delete',name,name,'succeeded',actor)
+        return {'ok':True}
     except HTTPException: raise
     except Exception as exc: raise HTTPException(400,str(exc))
 

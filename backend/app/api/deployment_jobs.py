@@ -87,7 +87,7 @@ def queue_redeploy_github(app_id: str):
     if app["source_type"] == "github-private" and not token:
         raise HTTPException(409, "Reconnect GitHub in Settings")
     secrets.append(token)
-    job = jobs.create_job(app["name"], "app:" + app["name"], app["source"], app["source_ref"])
+    job = jobs.create_job(app["name"], "app:" + app["name"], app["source"], app["source_ref"], app_id=app_id)
     jobs.submit_job(job, lambda: applications.redeploy_github(app_id), secrets)
     return job
 
@@ -136,7 +136,7 @@ async def queue_redeploy_zip(app_id: str, file: UploadFile = File(...)):
     secrets = environment_values(json.loads(app["env_json"] or "{}"))
     directory = await stage_zip(file)
     try:
-        job = jobs.create_job(app["name"], "app:" + app["name"], "ZIP upload")
+        job = jobs.create_job(app["name"], "app:" + app["name"], "ZIP upload", app_id=app_id)
     except Exception:
         shutil.rmtree(directory, ignore_errors=True)
         raise
@@ -148,10 +148,11 @@ async def queue_redeploy_zip(app_id: str, file: UploadFile = File(...)):
 
 
 @router.get("/{job_id}")
-def job_details(job_id: str, after: int = Query(0, ge=0)):
+def job_details(job_id: str, after: int = Query(0, ge=0), stage: str | None = None):
     job = jobs.get_job(job_id)
     with connection() as db:
-        rows = db.execute("SELECT id,created_at,stage,level,message FROM deployment_job_logs WHERE job_id=? AND id>? ORDER BY id LIMIT 501", (job_id, after)).fetchall()
+        rows = db.execute("SELECT id,created_at,stage,level,message FROM deployment_job_logs WHERE job_id=? AND id>? AND (? IS NULL OR stage=?) ORDER BY id LIMIT 501", (job_id, after, stage, stage)).fetchall()
+        job["stages"] = [dict(r) for r in db.execute("SELECT name,status,started_at,finished_at,duration_seconds,exit_code FROM deployment_job_stages WHERE job_id=? ORDER BY rowid",(job_id,))]
     job["logs"] = [dict(row) for row in rows[:500]]
     job["next_cursor"] = rows[min(499, len(rows) - 1)]["id"] if rows else after
     job["has_more"] = len(rows) > 500

@@ -1,4 +1,4 @@
-import CloudConsole from "@/components/cloud-console";
+import Portal from "@/components/portal";
 export default function Home() {
-  return <CloudConsole />;
+  return <Portal />;
 }

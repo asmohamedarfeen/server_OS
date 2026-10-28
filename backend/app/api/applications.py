@@ -1,4 +1,7 @@
 import json
+import functools
+import inspect
+from contextlib import contextmanager
 import os
 import re
 import signal
@@ -13,8 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 import docker
-from docker.errors import BuildError
+from docker.errors import BuildError, NotFound
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from ..core.auth import get_current_user
 from ..core.config import WORKSPACE_DIR
@@ -26,6 +30,38 @@ from ..services import deployment_jobs as jobs
 router = APIRouter(prefix="/api/apps", tags=["applications"], dependencies=[Depends(get_current_user)])
 
 def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_application_idle(app_id, name):
+    current=jobs.output().id if jobs.output() else ''
+    with connection() as db:
+        active=db.execute("SELECT id FROM deployment_jobs WHERE (app_id=? OR resource_key=?) AND status IN ('queued','running') AND id<>?",(app_id,'app:'+name,current)).fetchone()
+    if active:
+        raise HTTPException(409,{'message':'Wait for the active deployment before changing this application','job_id':active['id']})
+
+
+
+def application_mutation(function):
+    """Close both directions of the queue-versus-lifecycle race."""
+    def resource_key(args,kwargs):
+        app_id=kwargs.get('app_id') or args[0]
+        with connection() as db: row=db.execute('SELECT name FROM applications WHERE id=?',(app_id,)).fetchone()
+        if not row: raise HTTPException(404,'Application not found')
+        return 'app:'+row['name']
+    if inspect.iscoroutinefunction(function):
+        @functools.wraps(function)
+        async def asynchronous(*args,**kwargs):
+            if jobs.output(): return await function(*args,**kwargs)
+            with jobs.resource_operation(resource_key(args,kwargs)):
+                return await function(*args,**kwargs)
+        return asynchronous
+    @functools.wraps(function)
+    def synchronous(*args,**kwargs):
+        if jobs.output(): return function(*args,**kwargs)
+        with jobs.resource_operation(resource_key(args,kwargs)):
+            return function(*args,**kwargs)
+    return synchronous
+
 
 def record_deployment_attempt(attempt_id: str, source: str, source_ref: str, status: str, stage: str, message: str, app_id: str | None = None, image: str | None = None):
     with connection() as db:
@@ -158,12 +194,12 @@ def canonical_github_url(value):
         port = parsed.port
     except ValueError:
         return None
-    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"} or parsed.username or parsed.password or port:
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"} or parsed.username or parsed.password or port or parsed.query or parsed.fragment:
         return None
     match = re.fullmatch(r"/([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100})(?:\.git)?/?", parsed.path)
     if not match:
         return None
-    return f"https://github.com/{match.group(1)}/{match.group(2)}.git"
+    return f"https://github.com/{match.group(1)}/{match.group(2).removesuffix('.git')}.git"
 
 def build_image(engine, root: Path, image_tag: str):
     if not jobs.output():
@@ -195,11 +231,13 @@ def build_image(engine, root: Path, image_tag: str):
     return engine.images.get(image_tag)
 
 
-def verify_container(container):
-    if not jobs.output():
+def verify_container(container, app_id=None, port=None):
+    if not jobs.output() and app_id is None:
         return
     jobs.stage("verify", "Checking container startup and health")
-    deadline = time.monotonic() + 90
+    from ..services.pipelines import readiness_config
+    config = readiness_config(app_id) if app_id else {"path":"", "timeout":90, "expected_status":200}
+    deadline = time.monotonic() + config["timeout"]
     time.sleep(2)
     while True:
         container.reload()
@@ -209,11 +247,17 @@ def verify_container(container):
             jobs.log(container.logs(tail=50).decode("utf-8", errors="replace"), "error")
             raise HTTPException(400, f"Container startup failed: status={container.status}, health={health or 'not configured'}")
         if health != "starting":
+            if config['path']:
+                if not http_ready(container,port,config):
+                    if time.monotonic() >= deadline:
+                        raise HTTPException(400, f"HTTP readiness did not return {config['expected_status']} within {config['timeout']} seconds")
+                    time.sleep(1)
+                    continue
             jobs.log("Container health check passed" if health == "healthy" else "Container is running (no Docker health check is configured)")
             return
         if time.monotonic() >= deadline:
             jobs.log(container.logs(tail=50).decode("utf-8", errors="replace"), "error")
-            raise HTTPException(400, "Container health check did not become ready within 90 seconds")
+            raise HTTPException(400, "Container health check did not become ready within the configured timeout")
         time.sleep(2)
 
 
@@ -251,6 +295,8 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     except BuildError as exc:
         detail = "\n".join(x.get("stream", "") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400, f"Image build failed: {detail}")
+    from ..services.pipelines import before_deploy
+    before_deploy(docker,image,image_tag)
     host_port = None
     if not domain:
         occupied = set()
@@ -266,29 +312,80 @@ def deploy_tree(name: str, source: str, root: Path, domain: str | None, env_json
     labels = {"com.arfeen.managed": "true", "com.arfeen.app-id": app_id}
     kwargs = {"image": image.id, "name": f"arfeen-{safe}-{app_id[:8]}", "detach": True, "environment": env, "labels": labels, "ports": {f"{port}/tcp": host_port} if host_port else None, "network": "arfeen_internal"}
     if domain:
-        kwargs["labels"].update({"traefik.enable": "true", "traefik.http.routers." + safe + ".rule": f"Host(`{domain}`)", "traefik.http.routers." + safe + ".entrypoints": "web", "traefik.http.services." + safe + ".loadbalancer.server.port": str(port)})
+        kwargs["labels"].update({"traefik.enable": "false"})
         kwargs["ports"] = None
     if attempt:
         mark_attempt(attempt, "running", "deploy", "Starting the application container", app_id, image_tag)
     else:
         jobs.stage("deploy", "Starting the application container")
     container = docker.containers.run(**kwargs)
+    previous_route=None;switched=False
+    from ..services import application_routing as routing
     try:
-        docker.networks.get("arfeen_proxy").connect(container)
-        jobs.log(f"Started container {container.short_id}; image {image_tag}")
-        verify_container(container)
+        docker.networks.get('arfeen_proxy').connect(container)
+        jobs.log(f'Started container {container.short_id}; image {image_tag}')
+        if domain:
+            verify_container(container,app_id,port)
+            previous_route=routing.switch(app_id,domain,container,port)
+            switched=True
+        else:verify_container(container)
+        with connection() as db:
+            db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json,source_type,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, 'running', container.id, image_tag, domain, now(), env_json, source_type, source_ref))
+            db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), app_id, 'success', 'Build and deployment completed', now(), image_tag))
     except Exception:
-        try:
-            container.remove(force=True)
-        except Exception as cleanup_error:
-            jobs.log(f"Could not remove failed container {container.short_id}: {cleanup_error}", "error")
+        if switched:routing.restore(app_id,previous_route)
+        try:container.remove(force=True)
+        except Exception as cleanup_error:jobs.log(f'Could not remove failed container {container.short_id}: {cleanup_error}','error')
         raise
-    with connection() as db:
-        db.execute("INSERT INTO applications(id,name,source,framework,port,host_port,status,container_id,image,domain,created_at,env_json,source_type,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (app_id, safe, source, framework, port, host_port, "running", container.id, image_tag, domain, now(), env_json, source_type, source_ref))
-        db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), app_id, "success", "Build and deployment completed", now(), image_tag))
     if attempt:
         mark_attempt(attempt, "success", "complete", "Build and deployment completed", app_id, image_tag)
     return {"id": app_id, "name": safe, "source": source, "source_type": source_type, "source_ref": source_ref, "framework": framework, "port": port, "host_port": host_port, "status": "running", "container_id": container.short_id, "image": image_tag, "domain": domain, "url": f"http://{domain}" if domain else f"http://SERVER-IP:{host_port}"}
+
+
+@contextmanager
+def replacement_runtime(row,image,environment,port,engine=None):
+    """Verify and route the same candidate before retiring the serving container."""
+    from ..services import application_routing as routing
+    from ..services.pipelines import readiness_config
+    engine=engine or client()
+    try:old=engine.containers.get(row['container_id']);old_state=old.status;old_labels=dict(old.attrs.get('Config',{}).get('Labels') or {})
+    except Exception:old=None;old_state='missing';old_labels={}
+    labels={k:v for k,v in old_labels.items() if not k.startswith('traefik.')}
+    labels.update({'com.arfeen.managed':'true','com.arfeen.app-id':row['id'],'traefik.enable':'false'})
+    candidate=None;old_stopped=False;switched=False;previous_route=None
+    try:
+        if not row['domain'] and old and old_state=='running':
+            old.stop(timeout=10);old_stopped=True
+        candidate=engine.containers.create(image,name=f"arfeen-{row['name']}-{uuid.uuid4().hex[:8]}",environment=environment,labels=labels,ports=({f'{port}/tcp':row['host_port']} if row['host_port'] and not row['domain'] else None),network='arfeen_internal')
+        if row['domain']:engine.networks.get('arfeen_proxy').connect(candidate)
+        candidate.start()
+        jobs.log('Verifying the candidate while the existing domain application continues serving' if row['domain'] else 'Verifying the replacement container')
+        verify_container(candidate,row['id'],port)
+        if row['domain']:
+            jobs.log('Publishing the verified candidate and waiting for the proxy to acknowledge its deployment identifier')
+            previous_route=routing.switch(row['id'],row['domain'],candidate,port,readiness_config(row['id']))
+            switched=True
+        yield candidate
+    except Exception as exc:
+        if switched:
+            routing.restore(row['id'],previous_route)
+            try:routing.wait_applied(row['domain'],old.id if previous_route and old else None,readiness_config(row['id']),timeout=5,exclude=candidate.id)
+            except Exception:jobs.log('The previous route was restored; proxy acknowledgement was unavailable','error')
+        if candidate:
+            try:candidate.remove(force=True)
+            except Exception as cleanup:jobs.log(f'Could not remove failed candidate: {cleanup}','error')
+        if old and old_stopped:
+            try:old.start()
+            except Exception as restore_error:jobs.log(f'Could not restart the previous container: {restore_error}','error')
+        detail=safe_deployment_error(exc,environment=environment)
+        if isinstance(exc,HTTPException):raise HTTPException(exc.status_code,detail) from exc
+        raise HTTPException(400,f'Could not start the new deployment: {detail}') from exc
+    else:
+        if old:
+            try:
+                if row['domain'] and old_state=='running':old.stop(timeout=10)
+                old.remove()
+            except Exception as cleanup:jobs.log(f'The previous container could not be removed: {cleanup}','warning')
 
 @router.get("")
 def list_apps():
@@ -303,10 +400,31 @@ def list_apps():
             container=client().containers.get(value["container_id"])
             value["status"] = container.status
             value["health"] = container.attrs.get("State",{}).get("Health",{}).get("Status",container.status)
-        except Exception: value["status"] = "exited"
+        except NotFound:
+            value['status']='missing';value['health']='unknown';value['status_error']='Application container was not found'
+        except Exception:
+            value['status']='unknown';value['health']='unknown';value['status_error']='Container status is temporarily unavailable'
         value.pop("env_json", None)
         result.append(value)
     return result
+
+@router.get("/{app_id}/logs")
+def application_logs(app_id: str, tail: int = 2000):
+    with connection() as db:
+        row = db.execute("SELECT container_id FROM applications WHERE id=?", (app_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Application not found")
+    try:
+        container = client().containers.get(row["container_id"])
+        output = container.logs(tail=max(1, min(tail, 2000)), timestamps=True)
+        return JSONResponse(
+            {"logs": output.decode("utf-8", errors="replace"), "status": container.status, "container_id": row["container_id"]},
+            headers={"Cache-Control": "no-store"},
+        )
+    except NotFound:
+        raise HTTPException(404, "Application container is unavailable. It may be restarting or being replaced.")
+    except Exception:
+        raise HTTPException(503, "Application logs are temporarily unavailable. Check Docker and the container logging driver.")
 
 @router.post("/github")
 def deploy_github(body: dict):
@@ -345,7 +463,7 @@ def deploy_github(body: dict):
             raise HTTPException(400, "Enter a GitHub repository URL in owner/repository format")
         if ref and not valid_branch_ref(ref):
             raise HTTPException(400, "Choose a valid branch")
-        url = f"https://github.com/{match.group(1)}/{match.group(2)}.git"
+        url = f"https://github.com/{match.group(1)}/{match.group(2).removesuffix('.git')}.git"
     app_name = body.get("name") or Path(urlparse(url).path.rstrip("/")).stem.removesuffix(".git")
     if not isinstance(app_name, str):
         raise HTTPException(400, "Enter a valid application name")
@@ -444,6 +562,8 @@ def clone_github_repository(url: str, ref: str, destination: Path, token: str | 
         if process.returncode:
             detail = stderr.replace(token, "[redacted]") if token else stderr
             raise GitHubError(f"GitHub clone failed: {detail[-1200:].strip() or 'check repository access and branch name'}")
+        from ..services.pipelines import capture_commit
+        capture_commit(destination)
     finally:
         if helper_dir:
             helper_dir.cleanup()
@@ -492,8 +612,12 @@ async def deploy_zip(file: UploadFile = File(...), name: str = Form(...), domain
     finally: shutil.rmtree(source_dir, ignore_errors=True)
 
 def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = None):
+    from ..services.pipelines import attach_job, capture_commit
+    attach_job(app_id)
+    if (root / ".git").exists(): capture_commit(root)
     with connection() as db: row=db.execute("SELECT * FROM applications WHERE id=?",(app_id,)).fetchone()
     if not row: raise HTTPException(404,"Application not found")
+    ensure_application_idle(app_id,row["name"])
     jobs.add_secrets(json.loads(row["env_json"] or "{}").values())
     if attempt: mark_attempt(attempt,"running","detect","Detecting application framework",app_id)
     else: jobs.stage("detect", "Detecting application framework")
@@ -507,43 +631,24 @@ def redeploy_tree(app_id: str, root: Path, source: str, attempt: dict | None = N
     except BuildError as exc:
         detail="\n".join(x.get("stream","") for x in exc.build_log if x.get("stream"))[-6000:]
         raise HTTPException(400,f"Image build failed: {detail}")
-    try: old=docker.containers.get(row["container_id"]); old_labels=dict(old.attrs.get("Config",{}).get("Labels") or {}); old_state=old.status
-    except Exception: old=None; old_labels={"com.arfeen.managed":"true","com.arfeen.app-id":app_id}; old_state="missing"
-    labels=old_labels | {"com.arfeen.managed":"true","com.arfeen.app-id":app_id}
-    if row["domain"]:
-        labels.update({"traefik.enable":"true",f"traefik.http.routers.{row['name']}.rule":f"Host(`{row['domain']}`)",f"traefik.http.routers.{row['name']}.entrypoints":"web",f"traefik.http.services.{row['name']}.loadbalancer.server.port":str(port)})
-    previous_image=row["image"]
-    replacement=None
-    if attempt: mark_attempt(attempt,"running","deploy","Starting the replacement container",app_id,image_tag)
-    else: jobs.stage("deploy", "Starting the replacement container")
-    try:
-        if old and old.status=="running": old.stop(timeout=10)
-        replacement=docker.containers.create(image.id,name=f"arfeen-{row['name']}-{build_id[:8]}",environment=json.loads(row["env_json"] or "{}"),labels=labels,ports=({f"{port}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
-        if row["domain"]:
-            docker.networks.get("arfeen_proxy").connect(replacement)
-        replacement.start()
-        verify_container(replacement)
-    except Exception as exc:
-        if replacement:
-            try: replacement.remove(force=True)
-            except Exception: pass
-        if old and old_state=="running":
-            try: old.start()
-            except Exception: pass
-        raise HTTPException(400,f"Could not start the new deployment: {exc}")
-    if old:
-        try: old.remove()
-        except Exception: pass
-    with connection() as db:
-        db.execute("UPDATE applications SET source=?,framework=?,port=?,container_id=?,image=?,status='running' WHERE id=?",(source,framework,port,replacement.id,image_tag,app_id))
-        db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)",(build_id,app_id,"success",f"Redeployed {framework}",now(),image_tag))
+    from ..services.pipelines import before_deploy
+    before_deploy(docker,image,image_tag,app_id)
+    previous_image=row['image']
+    if attempt: mark_attempt(attempt,'running','deploy','Starting the replacement container',app_id,image_tag)
+    else:jobs.stage('deploy','Starting the replacement container')
+    with replacement_runtime(row,image.id,json.loads(row['env_json'] or '{}'),port,docker) as replacement:
+        with connection() as db:
+            db.execute("UPDATE applications SET source=?,framework=?,port=?,container_id=?,image=?,status='running' WHERE id=?",(source,framework,port,replacement.id,image_tag,app_id))
+            db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)",(build_id,app_id,'success',f'Redeployed {framework}',now(),image_tag))
     if attempt: mark_attempt(attempt,"success","complete",f"Redeployed {framework}",app_id,image_tag)
     return {"id":app_id,"name":row["name"],"framework":framework,"image":image_tag,"status":"running","previous_image":previous_image}
 
 @router.post("/{app_id}/redeploy/github")
+@application_mutation
 def redeploy_github(app_id: str):
     with connection() as db: row=db.execute("SELECT source,source_type,source_ref,name FROM applications WHERE id=?",(app_id,)).fetchone()
     if not row: raise HTTPException(404,"Application not found")
+    ensure_application_idle(app_id,row["name"])
     safe_source=canonical_github_url(row["source"])
     if row["source_type"] not in ("github", "github-private") or not safe_source:
         raise HTTPException(409,"This application was not deployed from a GitHub repository")
@@ -572,6 +677,7 @@ def redeploy_github(app_id: str):
     finally: shutil.rmtree(source_dir,ignore_errors=True)
 
 @router.post("/{app_id}/redeploy/zip")
+@application_mutation
 async def redeploy_zip(app_id: str,file: UploadFile=File(...)):
     if not (file.filename or "").lower().endswith(".zip"): raise HTTPException(400,"Upload a .zip archive")
     source_dir=WORKSPACE_DIR/str(uuid.uuid4());source_dir.mkdir(parents=True);archive=source_dir/"source.zip";total=0
@@ -616,38 +722,30 @@ def get_environment(app_id: str):
     return {"environment": json.loads(row["env_json"] or "{}")}
 
 @router.put("/{app_id}/environment")
+@application_mutation
 def update_environment(app_id: str, body: dict):
     environment = body.get("environment")
     if not isinstance(environment, dict) or len(environment) > 100 or not all(isinstance(k,str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}",k) and isinstance(v,str) and len(v)<=8192 for k,v in environment.items()):
         raise HTTPException(422, "Environment must contain up to 100 valid key and string value pairs")
     with connection() as db: row = db.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
     if not row: raise HTTPException(404, "Application not found")
-    docker=client(); old_env=json.loads(row["env_json"] or "{}"); old= docker.containers.get(row["container_id"]); labels=dict(old.attrs.get("Config",{}).get("Labels") or {})
-    try:
-        old.stop(timeout=10); old.remove()
-        replacement=docker.containers.run(row["image"],name=f"arfeen-{row['name']}-{uuid.uuid4().hex[:8]}",detach=True,environment=environment,labels=labels,ports=({f"{row['port']}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
-        if row["domain"]:
-            try: docker.networks.get("arfeen_proxy").connect(replacement)
-            except docker.errors.NotFound: pass
+    ensure_application_idle(app_id,row["name"])
+    jobs.add_secrets(environment.values())
+    with replacement_runtime(row,row['image'],environment,row['port']) as replacement:
         with connection() as db:
             db.execute("UPDATE applications SET container_id=?,env_json=?,status='running' WHERE id=?",(replacement.id,json.dumps(environment),app_id))
-            db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)",(str(uuid.uuid4()),app_id,"success","Application restarted with updated environment variables",now(),row["image"]))
-        return {"ok":True,"status":"running"}
-    except Exception as exc:
-        try:
-            restored=docker.containers.run(row["image"],name=f"arfeen-{row['name']}-{uuid.uuid4().hex[:8]}",detach=True,environment=old_env,labels=labels,ports=({f"{row['port']}/tcp":row["host_port"]} if row["host_port"] else None),network="arfeen_internal")
-            if row["domain"]:
-                try: docker.networks.get("arfeen_proxy").connect(restored)
-                except docker.errors.NotFound: pass
-            with connection() as db: db.execute("UPDATE applications SET container_id=? WHERE id=?",(restored.id,app_id))
-        except Exception: pass
-        raise HTTPException(400,f"Could not update environment and restart the app: {exc}")
+            db.execute('INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)',(str(uuid.uuid4()),app_id,'success','Application restarted with updated environment variables',now(),row['image']))
+    from ..services.pipelines import activity
+    activity('application.environment',app_id,row['name'])
+    return {'ok':True,'status':'running'}
 
 @router.post("/{app_id}/{action}")
+@application_mutation
 def app_action(app_id: str, action: str):
     with connection() as db:
         row = db.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
     if not row: raise HTTPException(404, "Application not found")
+    ensure_application_idle(app_id,row["name"])
     try:
         container = client().containers.get(row["container_id"])
         if action == "restart": container.restart()
@@ -657,23 +755,127 @@ def app_action(app_id: str, action: str):
             with connection() as db:
                 prev = db.execute("SELECT image FROM deployments WHERE app_id=? AND status='success' ORDER BY created_at DESC LIMIT 1 OFFSET 1", (app_id,)).fetchone()
             if not prev: raise HTTPException(409, "There is no earlier successful deployment to roll back to")
-            image = client().images.get(prev["image"])
-            container.stop(); container.remove()
-            ports = {f"{row['port']}/tcp": row["host_port"]} if row["host_port"] else None
-            old_labels=dict(container.attrs.get("Config",{}).get("Labels") or {})
-            replacement = client().containers.run(image.id, name=f"arfeen-{row['name']}-{uuid.uuid4().hex[:8]}", detach=True, environment=json.loads(row["env_json"] or "{}"), labels=old_labels, ports=ports, network="arfeen_internal")
-            if row["domain"]:
-                try: client().networks.get("arfeen_proxy").connect(replacement)
-                except docker.errors.NotFound: pass
-            with connection() as db:
-                db.execute("UPDATE applications SET container_id=?,image=?,status='running' WHERE id=?", (replacement.id, prev["image"], app_id))
-                db.execute("INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()),app_id,"success","Rolled back to previous image",now(),prev["image"]))
+            image = client().images.get(prev['image'])
+            with replacement_runtime(row,image.id,json.loads(row['env_json'] or '{}'),row['port']) as replacement:
+                with connection() as db:
+                    db.execute("UPDATE applications SET container_id=?,image=?,status='running' WHERE id=?",(replacement.id,prev['image'],app_id))
+                    db.execute('INSERT INTO deployments(id,app_id,status,message,created_at,image) VALUES(?,?,?,?,?,?)',(str(uuid.uuid4()),app_id,'success','Rolled back to previous image',now(),prev['image']))
         elif action == "delete":
-            container.remove(force=True)
+            from ..services import application_routing as routing
+            previous_route=routing.snapshot(app_id) if row['domain'] else None
+            if row['domain']:routing.remove(app_id)
+            try:container.remove(force=True)
+            except Exception:
+                if row['domain']:routing.restore(app_id,previous_route)
+                raise
             with connection() as db: db.execute("DELETE FROM applications WHERE id=?", (app_id,)); db.execute("DELETE FROM deployments WHERE app_id=?", (app_id,))
+            from ..services.pipelines import activity
+            activity("application.delete",app_id,row["name"])
             return {"ok": True}
         else: raise HTTPException(404, "Unsupported action")
+        if row['domain'] and action in ('start','restart'):
+            from ..services import application_routing as routing
+            from ..services.pipelines import readiness_config
+            verify_container(container,app_id,row['port'])
+            routing.switch(app_id,row['domain'],container,row['port'],readiness_config(app_id))
         with connection() as db: db.execute("UPDATE applications SET status=? WHERE id=?", ("running" if action in ("start","restart","rollback") else "stopped",app_id))
+        from ..services.pipelines import activity
+        activity("application."+action,app_id,row["name"])
         return {"ok": True, "status": action}
     except HTTPException: raise
     except Exception as exc: raise HTTPException(400, str(exc))
+
+
+class ReadinessBody(BaseModel):
+    path: str = ''
+    expected_status: int = Field(200, ge=100, le=599)
+    timeout: int = Field(90, ge=1, le=600)
+
+
+def http_ready(container, port, config):
+    """Probe only the replacement container address and never follow redirects."""
+    import urllib.request, urllib.error, ipaddress
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self,*args,**kwargs): return None
+    networks=container.attrs.get('NetworkSettings',{}).get('Networks',{})
+    address=networks.get('arfeen_internal',{}).get('IPAddress') or next((n.get('IPAddress') for n in networks.values() if n.get('IPAddress')),None)
+    if not address or not port: return False
+    try:
+        ipaddress.ip_address(address)
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+        try:
+            with opener.open(f'http://{address}:{int(port)}{config["path"]}',timeout=min(2,config['timeout'])) as response:
+                return response.status==config['expected_status']
+        except urllib.error.HTTPError as exc:
+            return exc.code==config['expected_status']
+    except (OSError,ValueError): return False
+
+
+@router.get('/{app_id}/readiness')
+def get_readiness(app_id: str):
+    from ..services.pipelines import application,readiness_config
+    application(app_id)
+    return readiness_config(app_id)
+
+
+@router.patch('/{app_id}/readiness')
+@application_mutation
+def update_readiness(app_id: str, body: dict):
+    from urllib.parse import unquote
+    from ..services.pipelines import application,readiness_config,activity
+    app=application(app_id)
+    ensure_application_idle(app_id,app['name'])
+    if set(body)-{'path','expected_status','timeout'}: raise HTTPException(422,'Unsupported readiness fields')
+    try: value=ReadinessBody(**(readiness_config(app_id)|body)).model_dump()
+    except Exception: raise HTTPException(422,'Invalid readiness configuration')
+    path=value['path'];decoded=unquote(path)
+    if path and (not path.startswith('/') or decoded.startswith('//') or any(c in decoded for c in '?#+\\') or any(ord(c)<33 or ord(c)==127 for c in decoded) or any(p in ('.','..') for p in decoded.split('/')) or len(path)>1024 or '%' in decoded):
+        raise HTTPException(422,'Readiness must be a local absolute URL path without traversal, query, or fragment')
+    with connection() as db:
+        db.execute('INSERT INTO app_readiness(app_id,path,expected_status,timeout) VALUES(?,?,?,?) ON CONFLICT(app_id) DO UPDATE SET path=excluded.path,expected_status=excluded.expected_status,timeout=excluded.timeout',(app_id,path,value['expected_status'],value['timeout']))
+    activity('application.readiness',app_id,app['name'])
+    return value
+
+
+@router.patch('/{app_id}/source')
+@application_mutation
+def update_source(app_id: str,body:dict):
+    from ..services.pipelines import application,activity
+    app=application(app_id)
+    ensure_application_idle(app_id,app['name'])
+    if set(body)-{'source','source_ref','source_type'}: raise HTTPException(422,'Unsupported source fields')
+    kind=body.get('source_type',app['source_type']);ref=body.get('source_ref',app['source_ref']);source=body.get('source',app['source'])
+    if kind not in ('github','github-private','zip') or not isinstance(ref,str): raise HTTPException(422,'Invalid source configuration')
+    if kind=='zip': source='ZIP upload';ref=''
+    else:
+        source=canonical_github_url(source)
+        if not source or (ref and not valid_branch_ref(ref)): raise HTTPException(422,'Choose a valid GitHub repository and branch')
+    with connection() as db:
+        if db.execute("SELECT 1 FROM deployment_jobs WHERE resource_key=? AND status IN ('running','queued')",('app:'+app['name'],)).fetchone(): raise HTTPException(409,'Wait for the active deployment before changing its source')
+        db.execute('UPDATE applications SET source=?,source_ref=?,source_type=? WHERE id=?',(source,ref,kind,app_id))
+        if kind=='zip': db.execute('UPDATE pipelines SET poll_enabled=0,last_commit=NULL WHERE app_id=?',(app_id,))
+        else: db.execute('UPDATE pipelines SET last_commit=NULL WHERE app_id=?',(app_id,))
+    activity('application.source',app_id,app['name'])
+    return {'source':source,'source_ref':ref,'source_type':kind}
+
+
+@router.get('/{app_id}/metrics')
+def application_metrics(app_id:str):
+    from ..services.pipelines import application
+    app=application(app_id)
+    result={'resource_id':app_id,'timestamp':now(),'available':False,'status':app['status']}
+    keys=('cpu_percent','memory_bytes','memory_limit_bytes','memory_percent','network_rx_bytes','network_tx_bytes','block_read_bytes','block_write_bytes','pids')
+    result.update(dict.fromkeys(keys))
+    try:
+        container=client().containers.get(app['container_id']);result['status']=container.status
+        if container.status!='running': result['reason']='Application container is not running';return result
+        stats=container.stats(stream=False);cpu=stats.get('cpu_stats',{});previous=stats.get('precpu_stats',{})
+        delta=cpu.get('cpu_usage',{}).get('total_usage',0)-previous.get('cpu_usage',{}).get('total_usage',0)
+        system=cpu.get('system_cpu_usage',0)-previous.get('system_cpu_usage',0)
+        count=cpu.get('online_cpus') or len(cpu.get('cpu_usage',{}).get('percpu_usage',[])) or 1
+        memory=stats.get('memory_stats',{});cache=memory.get('stats',{}).get('inactive_file',memory.get('stats',{}).get('total_inactive_file',0))
+        used=max(0,memory.get('usage',0)-cache);limit=memory.get('limit',0)
+        networks=stats.get('networks',{}).values();blocks=stats.get('blkio_stats',{}).get('io_service_bytes_recursive') or []
+        result.update(available=True,cpu_percent=max(0,delta/system*count*100) if system>0 else 0,memory_bytes=used,memory_limit_bytes=limit,memory_percent=used/limit*100 if limit else 0,network_rx_bytes=sum(n.get('rx_bytes',0) for n in networks),network_tx_bytes=sum(n.get('tx_bytes',0) for n in networks),block_read_bytes=sum(x.get('value',0) for x in blocks if x.get('op','').lower()=='read'),block_write_bytes=sum(x.get('value',0) for x in blocks if x.get('op','').lower()=='write'),pids=stats.get('pids_stats',{}).get('current',0))
+    except Exception: result['reason']='Application container metrics are temporarily unavailable'
+    return result

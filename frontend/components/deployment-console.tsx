@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, ArrowDownToLine, Check, CheckCircle2, Clock3, Copy, GitBranch, LoaderCircle, TerminalSquare, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { applicationUrl } from "@/lib/application-url";
 
 export type DeploymentJob = {
   id: string; name: string; source: string; ref: string;
@@ -158,7 +159,7 @@ export function DeploymentConsole({ jobId, onClose, onFinished }: {
         </main>
       </div>
       <footer className="deployment-console-footer"><span>#{jobId.slice(0, 8)} · Saved on your server</span><div>
-        {job?.status === "success" && (job.result?.domain || job.result?.host_port) && <a className="button button-light" target="_blank" rel="noreferrer" href={job.result.domain ? `http://${job.result.domain}` : `http://${window.location.hostname}:${job.result.host_port}`}>Open application ↗</a>}
+        {job?.status === "success" && job.result && (job.result.domain || job.result.host_port) && <a className="button button-light" target="_blank" rel="noreferrer" href={applicationUrl(job.result, window.location.hostname) || undefined}>Open application ↗</a>}
         <button className="button button-light" onClick={copyLogs}><Copy size={14} />{copied ? "Copied" : "Copy logs"}</button>
         <a className="button button-light" href={`/api/deployment-jobs/${jobId}/logs`} download><ArrowDownToLine size={14} />Download logs</a>
         <button className="button button-primary" onClick={onClose}>{job && active(job) ? "Continue in background" : "Done"}</button>
